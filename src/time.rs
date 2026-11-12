@@ -1,4 +1,5 @@
 use std::env;
+use std::fmt::Write as _;
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,26 +54,40 @@ pub fn local_datetime(seconds: i64) -> Option<DateTime> {
     })
 }
 
-pub fn format_time(seconds: i64, now: i64) -> String {
+/// Write the formatted timestamp for `seconds` relative to `now` into `out`,
+/// reusing `out`'s capacity across calls.
+pub fn push_format_time(seconds: i64, now: i64, out: &mut String) {
+    out.clear();
     let datetime = local_datetime(seconds).unwrap_or_else(|| utc_datetime(seconds));
-    format_time_at(seconds, now, datetime)
+    push_format_time_at(seconds, now, datetime, out);
 }
 
+/// Format the timestamp for `seconds` relative to `now`.
+#[allow(dead_code)] // used by the unit tests in src/main.rs
 pub fn format_time_at(seconds: i64, now: i64, datetime: DateTime) -> String {
+    let mut out = String::new();
+    push_format_time_at(seconds, now, datetime, &mut out);
+    out
+}
+
+/// Write the formatted timestamp into `out`, reusing `out`'s capacity.
+pub fn push_format_time_at(seconds: i64, now: i64, datetime: DateTime, out: &mut String) {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     const HALF_YEAR: i64 = 15_778_476;
 
+    out.clear();
     let month_name = MONTHS[(datetime.month - 1) as usize];
 
     if seconds < now && now - seconds <= HALF_YEAR {
-        format!(
+        let _ = write!(
+            out,
             "{} {:>2} {:02}:{:02}",
             month_name, datetime.day, datetime.hour, datetime.minute
-        )
+        );
     } else {
-        format!("{} {:>2}  {}", month_name, datetime.day, datetime.year)
+        let _ = write!(out, "{} {:>2}  {}", month_name, datetime.day, datetime.year);
     }
 }
 

@@ -1,3 +1,4 @@
+use std::cmp::{Ordering, Reverse};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self};
@@ -6,16 +7,70 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
+use std::fmt::Write as _;
+
 use crate::args::{ColorWhen, IgnoreMode, IndicatorStyle, Options, SortKey};
 use crate::color::paint;
 use crate::entry::{entry_kind, kind_of, needs_metadata, Entry, Kind};
 use crate::ids::{group_map, user_map};
-use crate::layout::{layout_columns, max_width, pad_right, DisplayItem};
-use crate::permissions::permissions;
+use crate::layout::{layout_columns, DisplayItem};
+use crate::permissions::push_permissions;
 use crate::quoting::{quote_for_message, quote_name};
-use crate::sizes::{format_blocks, human_size};
-use crate::sort::collate_names;
-use crate::time::{format_time, now_seconds, terminal_width};
+use crate::sizes::{format_blocks, push_format_blocks, push_human_size};
+use crate::sort::{collate_key, collate_names};
+use crate::time::{now_seconds, push_format_time, terminal_width};
+
+fn decimal_width(value: u64) -> usize {
+    value
+        .checked_ilog10()
+        .map_or(1, |digits| digits as usize + 1)
+}
+
+fn sort_names(entries: &mut [Entry]) {
+    // Precomputed collation keys are a large win on arbitrary readdir order,
+    // but TimSort handles ascending and descending runs in linear time. Sample
+    // a few hundred adjacent pairs and use keys only when the order looks
+    // genuinely mixed.
+    const SAMPLE: usize = 256;
+    let pairs = entries.len().saturating_sub(1).min(SAMPLE);
+    let inversions = entries
+        .windows(2)
+        .take(SAMPLE)
+        .filter(|pair| {
+            collate_names(pair[0].name.as_os_str(), pair[1].name.as_os_str()) == Ordering::Greater
+        })
+        .count();
+
+    if pairs == 0 {
+        return;
+    }
+
+    if inversions * 4 > pairs * 3 || inversions * 4 < pairs {
+        // Ascending, descending, or nearly monotonic.
+        entries.sort_by(|a, b| collate_names(a.name.as_os_str(), b.name.as_os_str()));
+    } else {
+        entries.sort_by_cached_key(|entry| collate_key(entry.name.as_os_str()));
+    }
+}
+
+/// Sort by a descending primary key, then by name within equal-key runs.
+fn sort_by_primary_then_names<K: Ord>(entries: &mut [Entry], key: impl Fn(&Entry) -> K) {
+    // `sort_by_key` is stable, so equal primary keys stay grouped in readdir order.
+    entries.sort_by_key(|entry| Reverse(key(entry)));
+
+    let mut start = 0;
+    while start < entries.len() {
+        let primary = key(&entries[start]);
+        let mut end = start + 1;
+        while end < entries.len() && key(&entries[end]) == primary {
+            end += 1;
+        }
+        if end - start > 1 {
+            sort_names(&mut entries[start..end]);
+        }
+        start = end;
+    }
+}
 
 pub struct Lister {
     pub opts: Options,
@@ -40,7 +95,7 @@ impl Lister {
             opts,
             color,
             tty,
-            out: io::BufWriter::new(io::stdout()),
+            out: io::BufWriter::with_capacity(64 * 1024, io::stdout()),
             had_error: false,
             serious_error: false,
             output_error: None,
@@ -51,7 +106,9 @@ impl Lister {
         if self.output_error.is_some() {
             return;
         }
-        if let Err(err) = writeln!(self.out, "{}", line) {
+        if let Err(err) = self.out.write_all(line.as_bytes()) {
+            self.output_error = Some(err);
+        } else if let Err(err) = self.out.write_all(b"\n") {
             self.output_error = Some(err);
         }
     }
@@ -140,10 +197,8 @@ impl Lister {
             if !*first_block {
                 self.write_line("");
             }
-            self.write_line(&format!(
-                "{}:",
-                quote_name(&path.to_string_lossy(), self.tty)
-            ));
+            let lossy_path = path.to_string_lossy();
+            self.write_line(&format!("{}:", quote_name(&lossy_path, self.tty)));
             *first_block = false;
         }
 
@@ -243,12 +298,12 @@ impl Lister {
             } else {
                 None
             };
-            let file_type = match dir_entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => match &meta {
-                    Some(m) => m.file_type(),
-                    None => match dir_entry.metadata() {
-                        Ok(m) => m.file_type(),
+            let file_type = match &meta {
+                Some(metadata) => metadata.file_type(),
+                None => match dir_entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => match dir_entry.metadata() {
+                        Ok(metadata) => metadata.file_type(),
                         Err(err) => {
                             self.had_error = true;
                             eprintln!(
@@ -296,25 +351,14 @@ impl Lister {
     fn sort_entries(&self, entries: &mut [Entry]) {
         match self.opts.sort {
             SortKey::None => {}
-            SortKey::Name => {
-                entries.sort_by(|a, b| collate_names(a.name.as_os_str(), b.name.as_os_str()));
-            }
+            SortKey::Name => sort_names(entries),
             SortKey::Time => {
-                entries.sort_by(|a, b| {
-                    b.metadata()
-                        .mtime()
-                        .cmp(&a.metadata().mtime())
-                        .then_with(|| b.metadata().mtime_nsec().cmp(&a.metadata().mtime_nsec()))
-                        .then_with(|| collate_names(a.name.as_os_str(), b.name.as_os_str()))
+                sort_by_primary_then_names(entries, |entry| {
+                    (entry.metadata().mtime(), entry.metadata().mtime_nsec())
                 });
             }
             SortKey::Size => {
-                entries.sort_by(|a, b| {
-                    b.metadata()
-                        .size()
-                        .cmp(&a.metadata().size())
-                        .then_with(|| collate_names(a.name.as_os_str(), b.name.as_os_str()))
-                });
+                sort_by_primary_then_names(entries, |entry| entry.metadata().size());
             }
         }
 
@@ -348,7 +392,10 @@ impl Lister {
         // Prefer the authoritative file_type from stat'd metadata when available;
         // fall back to dirent.d_type (cheap but unreliable on some filesystems)
         // when metadata was not loaded.
-        let ft = entry.meta.as_ref().map_or(entry.file_type, |m| m.file_type());
+        let ft = entry
+            .meta
+            .as_ref()
+            .map_or(entry.file_type, |m| m.file_type());
         if ft.is_symlink() {
             return if self.opts.indicator == IndicatorStyle::Classify {
                 "@"
@@ -396,7 +443,8 @@ impl Lister {
     }
 
     fn short_item(&self, entry: &Entry) -> DisplayItem {
-        let name = quote_name(&entry.name.to_string_lossy(), self.tty);
+        let lossy_name = entry.name.to_string_lossy();
+        let name = quote_name(&lossy_name, self.tty);
         let suffix = self.suffix(entry);
         let mut prefix = String::new();
 
@@ -411,7 +459,11 @@ impl Lister {
 
         let width = prefix.chars().count() + name.chars().count() + suffix.chars().count();
         let mut text = prefix;
-        text.push_str(&self.paint_entry(entry, &name));
+        if self.color {
+            text.push_str(&self.paint_entry(entry, name.as_ref()));
+        } else {
+            text.push_str(name.as_ref());
+        }
         text.push_str(suffix);
 
         DisplayItem { text, width }
@@ -457,97 +509,166 @@ impl Lister {
     }
 
     fn print_long(&mut self, entries: &[Entry]) {
-        struct Row {
-            inode: String,
-            blocks: String,
-            permissions: String,
-            links: String,
-            owner: String,
-            group: String,
-            size: String,
-            date: String,
-            name: String,
-        }
-
         let users = user_map();
         let groups = group_map();
         let now = now_seconds();
-        let mut rows = Vec::with_capacity(entries.len());
+
+        // Pass 1: measure the display width of each padded column. All field
+        // formatting is written into a single reused buffer so this pass does
+        // not allocate per entry.
+        let mut width_inode = 0;
+        let mut width_blocks = 0;
+        let mut width_links = 0;
+        let mut width_owner = 0;
+        let mut width_group = 0;
+        let mut width_size = 0;
+        let mut scratch = String::new();
+        let mut owner_fallback = String::new();
+        let mut group_fallback = String::new();
 
         for entry in entries {
             let meta = entry.metadata();
+
             let uid = meta.uid();
             let gid = meta.gid();
-
-            let owner = users.get(&uid).cloned().unwrap_or_else(|| uid.to_string());
-            let group = groups.get(&gid).cloned().unwrap_or_else(|| gid.to_string());
-
-            let size = if self.opts.human {
-                human_size(meta.size())
-            } else {
-                meta.size().to_string()
+            let owner: &str = match users.get(&uid) {
+                Some(name) => name.as_str(),
+                None => {
+                    owner_fallback.clear();
+                    let _ = write!(owner_fallback, "{}", uid);
+                    owner_fallback.as_str()
+                }
             };
+            let group: &str = match groups.get(&gid) {
+                Some(name) => name.as_str(),
+                None => {
+                    group_fallback.clear();
+                    let _ = write!(group_fallback, "{}", gid);
+                    group_fallback.as_str()
+                }
+            };
+            width_owner = width_owner.max(owner.chars().count());
+            width_group = width_group.max(group.chars().count());
 
-            let blocks = format_blocks(meta.blocks(), self.opts.human);
+            if self.opts.inode {
+                width_inode = width_inode.max(decimal_width(meta.ino()));
+            }
 
-            let quoted_name = quote_name(&entry.name.to_string_lossy(), self.tty);
-            let mut name = self.paint_entry(entry, &quoted_name);
-            name.push_str(self.suffix(entry));
-
-            if entry.file_type.is_symlink() {
-                if let Ok(target) = fs::read_link(&entry.path) {
-                    let target = quote_name(&target.to_string_lossy(), self.tty);
-                    name.push_str(" -> ");
-                    name.push_str(&self.paint_target(entry, &target));
+            if self.opts.blocks {
+                if self.opts.human {
+                    push_format_blocks(meta.blocks(), true, &mut scratch);
+                    width_blocks = width_blocks.max(scratch.len());
+                } else {
+                    width_blocks = width_blocks.max(decimal_width(meta.blocks() / 2));
                 }
             }
 
-            rows.push(Row {
-                inode: meta.ino().to_string(),
-                blocks,
-                permissions: permissions(meta),
-                links: meta.nlink().to_string(),
-                owner,
-                group,
-                size,
-                date: format_time(meta.mtime(), now),
-                name,
-            });
+            width_links = width_links.max(decimal_width(meta.nlink()));
+
+            if self.opts.human {
+                push_human_size(meta.size(), &mut scratch);
+                width_size = width_size.max(scratch.len());
+            } else {
+                width_size = width_size.max(decimal_width(meta.size()));
+            }
         }
 
-        let width_inode = max_width(rows.iter().map(|row| row.inode.as_str()));
-        let width_blocks = max_width(rows.iter().map(|row| row.blocks.as_str()));
-        let width_links = max_width(rows.iter().map(|row| row.links.as_str()));
-        let width_owner = max_width(rows.iter().map(|row| row.owner.as_str()));
-        let width_group = max_width(rows.iter().map(|row| row.group.as_str()));
-        let width_size = max_width(rows.iter().map(|row| row.size.as_str()));
+        // Pass 2: render each row directly into a reused output buffer,
+        // avoiding one allocated String per field plus a `Row` struct per
+        // entry. Permissions are always 10 characters; date and name are the
+        // final (unpadded) fields, matching the previous layout.
+        let line_capacity = width_inode
+            + width_blocks
+            + 10
+            + width_links
+            + width_owner
+            + width_group
+            + width_size
+            + 12
+            + 64;
+        let mut line = String::with_capacity(line_capacity);
 
-        for row in rows {
+        for entry in entries {
             if self.output_error.is_some() {
                 break;
             }
 
-            let mut line = String::new();
+            let meta = entry.metadata();
+            line.clear();
 
             if self.opts.inode {
-                line.push_str(&format!("{:>width$} ", row.inode, width = width_inode));
+                let _ = write!(line, "{:>width$} ", meta.ino(), width = width_inode);
             }
             if self.opts.blocks {
-                line.push_str(&format!("{:>width$} ", row.blocks, width = width_blocks));
+                push_format_blocks(meta.blocks(), self.opts.human, &mut scratch);
+                let _ = write!(line, "{:>width$} ", scratch, width = width_blocks);
             }
 
-            line.push_str(&row.permissions);
-            line.push_str(&format!(
-                " {:>width$} {} {} ",
-                row.links,
-                pad_right(&row.owner, width_owner),
-                pad_right(&row.group, width_group),
-                width = width_links
-            ));
-            line.push_str(&format!("{:>width$} ", row.size, width = width_size));
-            line.push_str(&row.date);
+            push_permissions(meta, &mut scratch);
+            line.push_str(&scratch);
+
+            let uid = meta.uid();
+            let gid = meta.gid();
+            let owner: &str = match users.get(&uid) {
+                Some(name) => name.as_str(),
+                None => {
+                    owner_fallback.clear();
+                    let _ = write!(owner_fallback, "{}", uid);
+                    owner_fallback.as_str()
+                }
+            };
+            let group: &str = match groups.get(&gid) {
+                Some(name) => name.as_str(),
+                None => {
+                    group_fallback.clear();
+                    let _ = write!(group_fallback, "{}", gid);
+                    group_fallback.as_str()
+                }
+            };
+            let _ = write!(
+                line,
+                " {:>width_links$} {:<width_owner$} {:<width_group$} ",
+                meta.nlink(),
+                owner,
+                group,
+                width_links = width_links,
+                width_owner = width_owner,
+                width_group = width_group,
+            );
+
+            scratch.clear();
+            if self.opts.human {
+                push_human_size(meta.size(), &mut scratch);
+            } else {
+                let _ = write!(scratch, "{}", meta.size());
+            }
+            let _ = write!(line, "{:>width$} ", scratch, width = width_size);
+
+            push_format_time(meta.mtime(), now, &mut scratch);
+            line.push_str(&scratch);
             line.push(' ');
-            line.push_str(&row.name);
+
+            let lossy_name = entry.name.to_string_lossy();
+            let quoted_name = quote_name(&lossy_name, self.tty);
+            if self.color {
+                line.push_str(&self.paint_entry(entry, quoted_name.as_ref()));
+            } else {
+                line.push_str(quoted_name.as_ref());
+            }
+            line.push_str(self.suffix(entry));
+
+            if entry.file_type.is_symlink() {
+                if let Ok(target) = fs::read_link(&entry.path) {
+                    let lossy_target = target.to_string_lossy();
+                    let target = quote_name(&lossy_target, self.tty);
+                    line.push_str(" -> ");
+                    if self.color {
+                        line.push_str(&self.paint_target(entry, target.as_ref()));
+                    } else {
+                        line.push_str(target.as_ref());
+                    }
+                }
+            }
 
             self.write_line(&line);
         }

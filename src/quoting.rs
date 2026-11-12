@@ -1,18 +1,23 @@
+use std::borrow::Cow;
+
 /// Shell-quote a filename for terminal display, if needed.
 ///
 /// Non-terminal output simply replaces newlines with `?` to preserve record
-/// boundaries.
-pub fn quote_name(name: &str, tty: bool) -> String {
+/// boundaries. Returns a borrowed slice when no quoting is needed.
+pub fn quote_name<'a>(name: &'a str, tty: bool) -> Cow<'a, str> {
     if !tty {
-        return name.replace('\n', "?");
+        if !name.contains('\n') {
+            return Cow::Borrowed(name);
+        }
+        return Cow::Owned(name.replace('\n', "?"));
     }
 
     if name.is_empty() {
-        return "''".to_string();
+        return Cow::Owned("''".to_string());
     }
 
     if !needs_shell_quoting(name) {
-        return name.to_string();
+        return Cow::Borrowed(name);
     }
 
     if name.chars().any(char::is_control) {
@@ -42,18 +47,18 @@ pub fn quote_name(name: &str, tty: bool) -> String {
         }
 
         result.push('\'');
-        return result;
+        return Cow::Owned(result);
     }
 
     if !name.contains('\'') {
-        return format!("'{}'", name);
+        return Cow::Owned(format!("'{}'", name));
     }
 
     if !name
         .chars()
         .any(|ch| matches!(ch, '"' | '$' | '`' | '\\' | '!'))
     {
-        return format!("\"{}\"", name);
+        return Cow::Owned(format!("\"{}\"", name));
     }
 
     let mut result = String::new();
@@ -69,9 +74,9 @@ pub fn quote_name(name: &str, tty: bool) -> String {
     }
 
     if result.is_empty() {
-        "''".to_string()
+        Cow::Owned("''".to_string())
     } else {
-        result
+        Cow::Owned(result)
     }
 }
 
@@ -110,7 +115,7 @@ fn needs_shell_quoting(name: &str) -> bool {
 pub fn quote_for_message(name: &str) -> String {
     let quoted = quote_name(name, true);
     if quoted.starts_with('\'') || quoted.starts_with('"') || quoted.starts_with("$'") {
-        quoted
+        quoted.into_owned()
     } else {
         format!("'{}'", quoted)
     }

@@ -55,17 +55,3 @@ pub fn layout_columns(items: &[DisplayItem], max_width: usize) -> Layout {
         widths: vec![items.iter().map(|item| item.width).max().unwrap_or(1)],
     }
 }
-
-pub fn max_width<'a>(values: impl Iterator<Item = &'a str>) -> usize {
-    values.map(|value| value.chars().count()).max().unwrap_or(1)
-}
-
-pub fn pad_right(value: &str, width: usize) -> String {
-    let length = value.chars().count();
-    let mut result = String::with_capacity(value.len() + width.saturating_sub(length));
-    result.push_str(value);
-    for _ in length..width {
-        result.push(' ');
-    }
-    result
-}

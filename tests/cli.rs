@@ -179,6 +179,17 @@ fn sorts_by_size_and_reverses() {
 }
 
 #[test]
+fn equal_size_ties_sort_by_name() {
+    let dir = TestDir::new("size-ties");
+    for name in ["c", "a", "b"] {
+        fs::write(dir.path().join(name), "x").unwrap();
+    }
+
+    let output = run(&dir, &["-S", "-1"]);
+    assert_eq!(stdout(&output), "a\nb\nc\n");
+}
+
+#[test]
 fn human_readable_sizes() {
     let dir = TestDir::new("human");
     fs::write(dir.path().join("file"), vec![b'x'; 2048]).unwrap();

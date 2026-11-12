@@ -1,8 +1,10 @@
 use std::fs::Metadata;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
-/// Render the 10-character Unix permission string (type + rwx + special bits).
-pub fn permissions(meta: &Metadata) -> String {
+/// Render the 10-character Unix permission string (type + rwx + special bits) into `out`,
+/// reusing `out`'s capacity across calls.
+pub fn push_permissions(meta: &Metadata, out: &mut String) {
+    out.clear();
     let ft = meta.file_type();
     let kind = if ft.is_dir() {
         'd'
@@ -21,8 +23,7 @@ pub fn permissions(meta: &Metadata) -> String {
     };
 
     let mode = meta.mode();
-    let mut result = String::with_capacity(10);
-    result.push(kind);
+    out.push(kind);
 
     let bits = [
         (0o400, 'r'),
@@ -52,8 +53,6 @@ pub fn permissions(meta: &Metadata) -> String {
             _ => {}
         }
 
-        result.push(ch);
+        out.push(ch);
     }
-
-    result
 }

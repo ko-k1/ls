@@ -1,1 +1,5 @@
 /target
+/perf.data
+/perf_*.txt
+/after_*.txt
+/fin_*.txt
