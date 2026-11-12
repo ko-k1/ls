@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::{CString, OsStr, OsString};
-use std::fs::{self, Metadata};
+use std::fs::{self, FileType, Metadata};
 use std::io::{self, IsTerminal, Write};
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::os::unix::ffi::OsStrExt;
@@ -269,8 +269,26 @@ Exit status:
 struct Entry {
     name: OsString,
     path: PathBuf,
-    meta: Metadata,
+    file_type: FileType,
+    meta: Option<Metadata>,
     target: Option<Metadata>,
+}
+
+impl Entry {
+    fn metadata(&self) -> &Metadata {
+        self.meta
+            .as_ref()
+            .expect("metadata was not loaded for this entry")
+    }
+}
+
+fn needs_metadata(opts: &Options) -> bool {
+    opts.long
+        || opts.blocks
+        || opts.inode
+        || opts.sort == SortKey::Time
+        || opts.sort == SortKey::Size
+        || opts.indicator == IndicatorStyle::Classify
 }
 
 #[derive(Clone, Copy)]
@@ -285,19 +303,18 @@ enum Kind {
     Device,
 }
 
-fn kind_of(meta: &Metadata) -> Kind {
-    let ft = meta.file_type();
-    if ft.is_dir() {
+fn kind_of(file_type: FileType, mode: Option<u32>) -> Kind {
+    if file_type.is_dir() {
         Kind::Dir
-    } else if ft.is_symlink() {
+    } else if file_type.is_symlink() {
         Kind::Link
-    } else if ft.is_fifo() {
+    } else if file_type.is_fifo() {
         Kind::Fifo
-    } else if ft.is_socket() {
+    } else if file_type.is_socket() {
         Kind::Socket
-    } else if ft.is_block_device() || ft.is_char_device() {
+    } else if file_type.is_block_device() || file_type.is_char_device() {
         Kind::Device
-    } else if ft.is_file() && meta.mode() & 0o111 != 0 {
+    } else if file_type.is_file() && mode.map_or(false, |m| m & 0o111 != 0) {
         Kind::Executable
     } else {
         Kind::Regular
@@ -305,14 +322,14 @@ fn kind_of(meta: &Metadata) -> Kind {
 }
 
 fn entry_kind(entry: &Entry) -> Kind {
-    if entry.meta.file_type().is_symlink() {
+    if entry.file_type.is_symlink() {
         if entry.target.is_some() {
             Kind::Link
         } else {
             Kind::Broken
         }
     } else {
-        kind_of(&entry.meta)
+        kind_of(entry.file_type, entry.meta.as_ref().map(|m| m.mode()))
     }
 }
 
@@ -400,7 +417,8 @@ impl Lister {
                     if is_dir && !self.opts.directory {
                         dirs.push(operand.clone());
                     } else {
-                        let target = if meta.file_type().is_symlink() {
+                        let file_type = meta.file_type();
+                        let target = if self.color && file_type.is_symlink() {
                             fs::metadata(operand).ok()
                         } else {
                             None
@@ -408,7 +426,8 @@ impl Lister {
                         files.push(Entry {
                             name: operand.as_os_str().to_owned(),
                             path: operand.clone(),
-                            meta,
+                            file_type,
+                            meta: Some(meta),
                             target,
                         });
                     }
@@ -504,7 +523,8 @@ impl Lister {
             for dot in [".", ".."] {
                 let dot_path = path.join(dot);
                 if let Ok(meta) = fs::symlink_metadata(&dot_path) {
-                    let target = if meta.file_type().is_symlink() {
+                    let file_type = meta.file_type();
+                    let target = if self.color && file_type.is_symlink() {
                         fs::metadata(&dot_path).ok()
                     } else {
                         None
@@ -512,7 +532,8 @@ impl Lister {
                     entries.push(Entry {
                         name: OsString::from(dot),
                         path: dot_path,
-                        meta,
+                        file_type,
+                        meta: Some(meta),
                         target,
                     });
                 }
@@ -542,30 +563,53 @@ impl Lister {
                 continue;
             }
 
-            match dir_entry.metadata() {
-                Ok(meta) => {
-                    let entry_path = dir_entry.path();
-                    let target = if meta.file_type().is_symlink() {
-                        fs::metadata(&entry_path).ok()
-                    } else {
-                        None
-                    };
-                    entries.push(Entry {
-                        name,
-                        path: entry_path,
-                        meta,
-                        target,
-                    });
+            let meta = if needs_metadata(&self.opts) {
+                match dir_entry.metadata() {
+                    Ok(meta) => Some(meta),
+                    Err(err) => {
+                        self.had_error = true;
+                        eprintln!(
+                            "ls: cannot access {}: {}",
+                            quote_for_message(&dir_entry.path().to_string_lossy()),
+                            err
+                        );
+                        continue;
+                    }
                 }
-                Err(err) => {
-                    self.had_error = true;
-                    eprintln!(
-                        "ls: cannot access {}: {}",
-                        quote_for_message(&dir_entry.path().to_string_lossy()),
-                        err
-                    );
-                }
-            }
+            } else {
+                None
+            };
+            let file_type = match dir_entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => match &meta {
+                    Some(m) => m.file_type(),
+                    None => match dir_entry.metadata() {
+                        Ok(m) => m.file_type(),
+                        Err(err) => {
+                            self.had_error = true;
+                            eprintln!(
+                                "ls: cannot access {}: {}",
+                                quote_for_message(&dir_entry.path().to_string_lossy()),
+                                err
+                            );
+                            continue;
+                        }
+                    },
+                },
+            };
+            let entry_path = dir_entry.path();
+            let target = if self.color && file_type.is_symlink() {
+                fs::metadata(&entry_path).ok()
+            } else {
+                None
+            };
+            entries.push(Entry {
+                name,
+                path: entry_path,
+                file_type,
+                meta,
+                target,
+            });
         }
 
         self.sort_entries(&mut entries);
@@ -576,7 +620,7 @@ impl Lister {
                 .into_iter()
                 .filter(|entry| {
                     let name = entry.name.as_os_str();
-                    entry.meta.file_type().is_dir()
+                    entry.file_type.is_dir()
                         && name != OsStr::new(".")
                         && name != OsStr::new("..")
                 })
@@ -595,18 +639,18 @@ impl Lister {
             }
             SortKey::Time => {
                 entries.sort_by(|a, b| {
-                    b.meta
+                    b.metadata()
                         .mtime()
-                        .cmp(&a.meta.mtime())
-                        .then_with(|| b.meta.mtime_nsec().cmp(&a.meta.mtime_nsec()))
+                        .cmp(&a.metadata().mtime())
+                        .then_with(|| b.metadata().mtime_nsec().cmp(&a.metadata().mtime_nsec()))
                         .then_with(|| collate_names(a.name.as_os_str(), b.name.as_os_str()))
                 });
             }
             SortKey::Size => {
                 entries.sort_by(|a, b| {
-                    b.meta
+                    b.metadata()
                         .size()
-                        .cmp(&a.meta.size())
+                        .cmp(&a.metadata().size())
                         .then_with(|| collate_names(a.name.as_os_str(), b.name.as_os_str()))
                 });
             }
@@ -617,13 +661,16 @@ impl Lister {
         }
 
         if self.opts.dirs_first && self.opts.sort != SortKey::None {
-            entries.sort_by_key(|entry| !entry.meta.file_type().is_dir());
+            entries.sort_by_key(|entry| !entry.file_type.is_dir());
         }
     }
 
     fn print_entries(&mut self, entries: &[Entry], from_directory: bool) {
         if from_directory && (self.opts.long || self.opts.blocks) {
-            let total: u64 = entries.iter().map(|entry| entry.meta.blocks()).sum();
+            let total: u64 = entries
+                .iter()
+                .map(|entry| entry.metadata().blocks())
+                .sum();
             self.write_line(&format!("total {}", format_blocks(total, self.opts.human)));
         }
 
@@ -639,7 +686,7 @@ impl Lister {
     }
 
     fn suffix(&self, entry: &Entry) -> &'static str {
-        let ft = entry.meta.file_type();
+        let ft = entry.file_type;
         if ft.is_symlink() {
             return if self.opts.indicator == IndicatorStyle::Classify {
                 "@"
@@ -657,7 +704,7 @@ impl Lister {
         if self.opts.indicator != IndicatorStyle::Classify {
             return "";
         }
-        if ft.is_file() && entry.meta.mode() & 0o111 != 0 {
+        if ft.is_file() && entry.meta.as_ref().map_or(false, |m| m.mode() & 0o111 != 0) {
             "*"
         } else if ft.is_fifo() {
             "|"
@@ -680,7 +727,7 @@ impl Lister {
             return text.to_string();
         }
         let kind = match &entry.target {
-            Some(meta) => kind_of(meta),
+            Some(meta) => kind_of(meta.file_type(), Some(meta.mode())),
             None => Kind::Broken,
         };
         paint(kind, text)
@@ -692,11 +739,11 @@ impl Lister {
         let mut prefix = String::new();
 
         if self.opts.inode {
-            prefix.push_str(&entry.meta.ino().to_string());
+            prefix.push_str(&entry.metadata().ino().to_string());
             prefix.push(' ');
         }
         if self.opts.blocks {
-            prefix.push_str(&format_blocks(entry.meta.blocks(), self.opts.human));
+            prefix.push_str(&format_blocks(entry.metadata().blocks(), self.opts.human));
             prefix.push(' ');
         }
 
@@ -762,10 +809,11 @@ impl Lister {
 
         let users = user_map();
         let groups = group_map();
+        let now = now_seconds();
         let mut rows = Vec::with_capacity(entries.len());
 
         for entry in entries {
-            let meta = &entry.meta;
+            let meta = entry.metadata();
             let uid = meta.uid();
             let gid = meta.gid();
 
@@ -784,7 +832,7 @@ impl Lister {
             let mut name = self.paint_entry(entry, &quoted_name);
             name.push_str(self.suffix(entry));
 
-            if meta.file_type().is_symlink() {
+            if entry.file_type.is_symlink() {
                 if let Ok(target) = fs::read_link(&entry.path) {
                     let target = quote_name(&target.to_string_lossy(), self.tty);
                     name.push_str(" -> ");
@@ -800,7 +848,7 @@ impl Lister {
                 owner,
                 group,
                 size,
-                date: format_time(meta.mtime()),
+                date: format_time(meta.mtime(), now),
                 name,
             });
         }
@@ -1173,9 +1221,9 @@ fn local_datetime(seconds: i64) -> Option<DateTime> {
     })
 }
 
-fn format_time(seconds: i64) -> String {
+fn format_time(seconds: i64, now: i64) -> String {
     let datetime = local_datetime(seconds).unwrap_or_else(|| utc_datetime(seconds));
-    format_time_at(seconds, now_seconds(), datetime)
+    format_time_at(seconds, now, datetime)
 }
 
 fn format_time_at(seconds: i64, now: i64, datetime: DateTime) -> String {
