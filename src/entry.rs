@@ -16,17 +16,51 @@ pub enum Kind {
     Device,
 }
 
+/// The metadata fields `ls` actually displays, stored compactly.
+///
+/// Keeping the full libc `Metadata` would make `Entry` more than twice as large
+/// and turn sorting into a memory-bandwidth exercise.
+#[derive(Clone, Copy)]
+pub struct EntryMeta {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub nlink: u64,
+    pub size: u64,
+    pub ino: u64,
+    pub blocks: u64,
+    pub mtime: i64,
+    pub mtime_nsec: i64,
+}
+
+impl EntryMeta {
+    pub fn from_metadata(meta: &Metadata) -> Self {
+        Self {
+            mode: meta.mode(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+            nlink: meta.nlink(),
+            size: meta.size(),
+            ino: meta.ino(),
+            blocks: meta.blocks(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        }
+    }
+}
+
 /// A single directory entry with its name, path, and (optionally loaded) metadata.
 pub struct Entry {
     pub name: std::ffi::OsString,
     pub path: std::path::PathBuf,
     pub file_type: FileType,
-    pub meta: Option<Metadata>,
-    pub target: Option<Metadata>,
+    pub meta: Option<EntryMeta>,
+    /// Kind of the symlink target, when color output required resolving it.
+    pub target: Option<Kind>,
 }
 
 impl Entry {
-    pub fn metadata(&self) -> &Metadata {
+    pub fn metadata(&self) -> &EntryMeta {
         self.meta
             .as_ref()
             .expect("metadata was not loaded for this entry")
@@ -69,6 +103,6 @@ pub fn entry_kind(entry: &Entry) -> Kind {
             Kind::Broken
         }
     } else {
-        kind_of(entry.file_type, entry.meta.as_ref().map(|m| m.mode()))
+        kind_of(entry.file_type, entry.meta.as_ref().map(|m| m.mode))
     }
 }

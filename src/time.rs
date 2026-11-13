@@ -78,17 +78,45 @@ pub fn push_format_time_at(seconds: i64, now: i64, datetime: DateTime, out: &mut
     const HALF_YEAR: i64 = 15_778_476;
 
     out.clear();
-    let month_name = MONTHS[(datetime.month - 1) as usize];
+    out.push_str(MONTHS[(datetime.month - 1) as usize]);
+    out.push(' ');
+
+    if datetime.day < 10 {
+        out.push(' ');
+        push_digit(out, datetime.day as u8);
+    } else {
+        push_two_digits(out, datetime.day as u8);
+    }
 
     if seconds < now && now - seconds <= HALF_YEAR {
-        let _ = write!(
-            out,
-            "{} {:>2} {:02}:{:02}",
-            month_name, datetime.day, datetime.hour, datetime.minute
-        );
+        out.push(' ');
+        push_two_digits(out, datetime.hour as u8);
+        out.push(':');
+        push_two_digits(out, datetime.minute as u8);
     } else {
-        let _ = write!(out, "{} {:>2}  {}", month_name, datetime.day, datetime.year);
+        out.push_str("  ");
+        // nstrftime's `%Y` zero-pads to four digits. Keep the common year range
+        // on the manual fast path; `{:04}` handles negative years and the rare
+        // years beyond 9999 with the same padding and sign.
+        if (0..=9999).contains(&datetime.year) {
+            let year = datetime.year as u16;
+            out.push((b'0' + (year / 1000) as u8) as char);
+            out.push((b'0' + (year / 100 % 10) as u8) as char);
+            out.push((b'0' + (year / 10 % 10) as u8) as char);
+            out.push((b'0' + (year % 10) as u8) as char);
+        } else {
+            let _ = write!(out, "{:04}", datetime.year);
+        }
     }
+}
+
+fn push_digit(out: &mut String, digit: u8) {
+    out.push((b'0' + digit) as char);
+}
+
+fn push_two_digits(out: &mut String, value: u8) {
+    out.push((b'0' + value / 10) as char);
+    out.push((b'0' + value % 10) as char);
 }
 
 pub fn civil_from_days(days: i64) -> (i64, u32, u32) {

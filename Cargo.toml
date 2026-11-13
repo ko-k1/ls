@@ -2,7 +2,7 @@
 name = "ls"
 version = "0.1.0"
 edition = "2021"
-description = "A small, dependency-free ls implementation for Unix"
+description = "A fast ls implementation for Unix"
 license = "MIT"
 
 [[bin]]
@@ -12,3 +12,6 @@ path = "src/main.rs"
 [profile.release]
 opt-level = 3
 lto = true
+
+[dependencies]
+rayon = "1.12.0"

@@ -52,7 +52,7 @@ fn main() {
 mod tests {
     use crate::quoting::quote_name;
     use crate::sizes::{format_blocks, human_size};
-    use crate::time::{civil_from_days, format_time_at, utc_datetime};
+    use crate::time::{civil_from_days, format_time_at, utc_datetime, DateTime};
 
     #[test]
     fn human_sizes() {
@@ -77,6 +77,26 @@ mod tests {
             format_time_at(951_782_400, now, utc_datetime(951_782_400)),
             "Feb 29  2000"
         );
+    }
+
+    #[test]
+    fn years_are_zero_padded_like_gnu_ls() {
+        let now = 4_000_000_000;
+        let date = |year| DateTime {
+            year,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+        };
+
+        assert_eq!(format_time_at(0, now, date(-1)), "Jan  1  -001");
+        assert_eq!(format_time_at(0, now, date(0)), "Jan  1  0000");
+        assert_eq!(format_time_at(0, now, date(500)), "Jan  1  0500");
+        assert_eq!(format_time_at(0, now, date(999)), "Jan  1  0999");
+        assert_eq!(format_time_at(0, now, date(1000)), "Jan  1  1000");
+        assert_eq!(format_time_at(0, now, date(9999)), "Jan  1  9999");
+        assert_eq!(format_time_at(0, now, date(10000)), "Jan  1  10000");
     }
 
     #[test]

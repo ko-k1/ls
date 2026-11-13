@@ -1,6 +1,9 @@
 # ls (Rust)
 
-A small, dependency-free `ls` implementation for Unix, written in Rust.
+A fast `ls` implementation for Unix, written in Rust.
+
+Large directories are listed with parallel metadata loading and sorting (via
+Rayon), with a fast path for the common lowercase-ASCII/digit filename alphabet.
 
 ## Features
 

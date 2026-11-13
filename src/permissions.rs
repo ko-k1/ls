@@ -1,58 +1,50 @@
-use std::fs::Metadata;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::fs::FileType;
+use std::os::unix::fs::FileTypeExt;
 
 /// Render the 10-character Unix permission string (type + rwx + special bits) into `out`,
 /// reusing `out`'s capacity across calls.
-pub fn push_permissions(meta: &Metadata, out: &mut String) {
+pub fn push_permissions(file_type: FileType, mode: u32, out: &mut String) {
     out.clear();
-    let ft = meta.file_type();
-    let kind = if ft.is_dir() {
+    let kind = if file_type.is_dir() {
         'd'
-    } else if ft.is_symlink() {
+    } else if file_type.is_symlink() {
         'l'
-    } else if ft.is_fifo() {
+    } else if file_type.is_fifo() {
         'p'
-    } else if ft.is_socket() {
+    } else if file_type.is_socket() {
         's'
-    } else if ft.is_block_device() {
+    } else if file_type.is_block_device() {
         'b'
-    } else if ft.is_char_device() {
+    } else if file_type.is_char_device() {
         'c'
     } else {
         '-'
     };
 
-    let mode = meta.mode();
-    out.push(kind);
+    let mut buffer = [b'-'; 10];
+    buffer[0] = kind as u8;
 
-    let bits = [
-        (0o400, 'r'),
-        (0o200, 'w'),
-        (0o100, 'x'),
-        (0o040, 'r'),
-        (0o020, 'w'),
-        (0o010, 'x'),
-        (0o004, 'r'),
-        (0o002, 'w'),
-        (0o001, 'x'),
+    const TRIPLETS: [&[u8; 3]; 8] = [
+        b"---", b"--x", b"-w-", b"-wx", b"r--", b"r-x", b"rw-", b"rwx",
     ];
 
-    for (index, (mask, character)) in bits.iter().enumerate() {
-        let mut ch = if mode & mask != 0 { *character } else { '-' };
-
-        match index {
-            2 if mode & 0o4000 != 0 => {
-                ch = if ch == 'x' { 's' } else { 'S' };
-            }
-            5 if mode & 0o2000 != 0 => {
-                ch = if ch == 'x' { 's' } else { 'S' };
-            }
-            8 if mode & 0o1000 != 0 => {
-                ch = if ch == 'x' { 't' } else { 'T' };
-            }
-            _ => {}
-        }
-
-        out.push(ch);
+    for (index, shift) in [6, 3, 0].into_iter().enumerate() {
+        let triplet = TRIPLETS[((mode >> shift) & 7) as usize];
+        let start = 1 + index * 3;
+        buffer[start] = triplet[0];
+        buffer[start + 1] = triplet[1];
+        buffer[start + 2] = triplet[2];
     }
+
+    if mode & 0o4000 != 0 {
+        buffer[3] = if buffer[3] == b'x' { b's' } else { b'S' };
+    }
+    if mode & 0o2000 != 0 {
+        buffer[6] = if buffer[6] == b'x' { b's' } else { b'S' };
+    }
+    if mode & 0o1000 != 0 {
+        buffer[9] = if buffer[9] == b'x' { b't' } else { b'T' };
+    }
+
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buffer) });
 }
