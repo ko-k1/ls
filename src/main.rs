@@ -4,12 +4,15 @@ use std::io::Write;
 
 mod args;
 mod color;
+mod dir;
 mod entry;
+mod format;
 mod ids;
 mod layout;
 mod lister;
 mod permissions;
 mod quoting;
+mod render;
 mod sizes;
 mod sort;
 mod time;

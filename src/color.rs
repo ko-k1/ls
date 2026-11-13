@@ -14,10 +14,18 @@ pub fn color_code(kind: Kind) -> Option<&'static str> {
     }
 }
 
-/// Wrap `text` in ANSI color escapes if the kind has a color assigned.
-pub fn paint(kind: Kind, text: &str) -> String {
+/// Append `text` to `out`, wrapped in ANSI color escapes when the kind has a
+/// color assigned. Writing directly avoids the temporary `String` that a
+/// returning `paint()` helper would need.
+pub fn push_paint(out: &mut String, kind: Kind, text: &str) {
     match color_code(kind) {
-        Some(code) => format!("\x1b[{}m{}\x1b[0m", code, text),
-        None => text.to_string(),
+        Some(code) => {
+            out.push_str("\x1b[");
+            out.push_str(code);
+            out.push('m');
+            out.push_str(text);
+            out.push_str("\x1b[0m");
+        }
+        None => out.push_str(text),
     }
 }

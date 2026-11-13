@@ -1,21 +1,6 @@
 use std::fmt::Write as _;
 
-fn push_decimal(out: &mut String, value: u64) {
-    let mut buffer = [0u8; 20];
-    let mut start = buffer.len();
-    let mut value = value;
-
-    loop {
-        start -= 1;
-        buffer[start] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-
-    out.push_str(unsafe { std::str::from_utf8_unchecked(&buffer[start..]) });
-}
+use crate::format::push_u64;
 
 /// Format a byte count in a human-readable form (e.g. `1.5K`, `3.0G`).
 #[allow(dead_code)] // used by the unit tests in src/main.rs
@@ -32,7 +17,7 @@ pub fn push_human_size(bytes: u64, out: &mut String) {
 
     out.clear();
     if bytes < 1024 {
-        push_decimal(out, bytes);
+        push_u64(out, bytes);
         return;
     }
 
@@ -60,7 +45,7 @@ pub fn push_format_blocks(blocks: u64, human: bool, out: &mut String) {
     if human {
         push_human_size(blocks.saturating_mul(512), out);
     } else {
-        push_decimal(out, blocks / 2);
+        push_u64(out, blocks / 2);
     }
 }
 

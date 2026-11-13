@@ -1,9 +1,8 @@
-use std::fs::FileType;
-use std::os::unix::fs::FileTypeExt;
+use crate::entry::EntryType;
 
 /// Render the 10-character Unix permission string (type + rwx + special bits) into `out`,
 /// reusing `out`'s capacity across calls.
-pub fn push_permissions(file_type: FileType, mode: u32, out: &mut String) {
+pub fn push_permissions(file_type: EntryType, mode: u32, out: &mut String) {
     out.clear();
     let kind = if file_type.is_dir() {
         'd'

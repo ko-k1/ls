@@ -1,4 +1,6 @@
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -308,6 +310,30 @@ fn sort_option_accepts_separate_argument() {
     let output = run(&dir, &["--sort"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires an argument"));
+}
+
+#[test]
+fn color_marks_executables() {
+    let dir = TestDir::new("color-exec");
+    fs::write(dir.path().join("run.sh"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(dir.path().join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = run(&dir, &["--color=always", "-1"]);
+    let text = stdout(&output);
+
+    assert!(text.contains("\x1b[1;32mrun.sh\x1b[0m"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn piped_output_preserves_non_utf8_names() {
+    let dir = TestDir::new("non-utf8");
+    let name = OsString::from_vec(b"f\xffo".to_vec());
+    fs::write(dir.path().join(&name), "").unwrap();
+
+    let output = run(&dir, &["-1"]);
+
+    assert_eq!(output.stdout, b"f\xffo\n");
 }
 
 #[test]
