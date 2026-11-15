@@ -68,3 +68,9 @@ cargo test
 
 The suite includes unit tests for size/date formatting and integration tests
 that exercise the built binary.
+
+## Benchmarks
+
+`bench/` holds a fixture generator, an output-compatibility check against
+GNU `ls`, and a benchmark that compares two builds. See
+[bench/README.md](bench/README.md).
