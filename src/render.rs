@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::fs;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 
@@ -455,12 +454,16 @@ impl<'a> Renderer<'a> {
             line.push_str(self.suffix(entry));
 
             if entry.file_type.is_symlink() {
-                if let Ok(target) = fs::read_link(&entry.path) {
+                if let Some(target) = &entry.link_target {
                     let lossy_target = target.to_string_lossy();
                     let target = quote_name(&lossy_target, self.tty);
                     line.push_str(" -> ");
                     if self.color {
-                        push_paint(&mut line, entry.target.unwrap_or(Kind::Broken), &target);
+                        push_paint(
+                            &mut line,
+                            entry.target_kind.unwrap_or(Kind::Broken),
+                            &target,
+                        );
                     } else {
                         line.push_str(&target);
                     }

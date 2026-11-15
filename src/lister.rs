@@ -10,9 +10,7 @@ use rayon::prelude::*;
 
 use crate::args::{ColorWhen, IgnoreMode, IndicatorStyle, Options};
 use crate::dir::DirReader;
-use crate::entry::{
-    build_entry, kind_of, needs_metadata, Entry, EntryMeta, EntryType,
-};
+use crate::entry::{build_entry, kind_of, may_stat, Entry, EntryMeta, EntryType};
 use crate::quoting::{quote_for_message, quote_name};
 use crate::render::Renderer;
 use crate::sort::sort_entries;
@@ -75,19 +73,24 @@ impl Lister {
                         dirs.push(operand.clone());
                     } else {
                         let file_type = EntryType::from_mode(meta.mode());
-                        let target = if self.color && file_type.is_symlink() {
+                        let target_kind = if self.color && file_type.is_symlink() {
                             fs::metadata(operand).ok().map(|target| {
                                 kind_of(EntryType::from_mode(target.mode()), Some(target.mode()))
                             })
                         } else {
                             None
                         };
+                        let link_target = if self.opts.long && file_type.is_symlink() {
+                            fs::read_link(operand).ok().map(PathBuf::into_os_string)
+                        } else {
+                            None
+                        };
                         files.push(Entry {
                             name: operand.as_os_str().to_owned(),
-                            path: operand.clone(),
+                            link_target,
                             file_type,
                             meta: Some(EntryMeta::from_metadata(&meta)),
-                            target,
+                            target_kind,
                         });
                     }
                 }
@@ -205,7 +208,7 @@ impl Lister {
                 let dot_path = path.join(dot);
                 if let Ok(meta) = fs::symlink_metadata(&dot_path) {
                     let file_type = EntryType::from_mode(meta.mode());
-                    let target = if self.color && file_type.is_symlink() {
+                    let target_kind = if self.color && file_type.is_symlink() {
                         fs::metadata(&dot_path).ok().map(|target| {
                             kind_of(EntryType::from_mode(target.mode()), Some(target.mode()))
                         })
@@ -214,10 +217,10 @@ impl Lister {
                     };
                     entries.push(Entry {
                         name: OsString::from(dot),
-                        path: dot_path,
+                        link_target: None,
                         file_type,
                         meta: Some(EntryMeta::from_metadata(&meta)),
-                        target,
+                        target_kind,
                     });
                 }
             }
@@ -252,7 +255,7 @@ impl Lister {
 
         let loaded: Vec<Result<Entry, (PathBuf, io::Error)>> =
             if raw_entries.len() >= PARALLEL_STAT_THRESHOLD
-                && needs_metadata(&self.opts, self.color)
+                && may_stat(&self.opts, self.color)
             {
                 let opts = &self.opts;
                 let color = self.color;
@@ -293,7 +296,7 @@ impl Lister {
                     let name = entry.name.as_os_str();
                     entry.file_type.is_dir() && name != "." && name != ".."
                 })
-                .map(|entry| entry.path)
+                .map(|entry| path.join(&entry.name))
                 .collect()
         } else {
             Vec::new()

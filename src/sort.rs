@@ -22,21 +22,58 @@ const STACK_NAME: usize = 256;
 
 const PARALLEL_SORT_THRESHOLD: usize = 8 * 1024;
 
-/// Locale-aware comparison of two entry names.
+/// Smallest sort that probes the locale for the ASCII fast path.
+///
+/// The probe costs about 415 `strcoll` calls (~330k instructions), once per
+/// process. Measured under en_US.UTF-8, plain `strcoll` is cheaper up to
+/// roughly 100 real-world names and 140 synthetic mixed-case names, so small
+/// sorts skip the probe unless an earlier, larger sort already paid for it.
+const FAST_PATH_MIN: usize = 128;
+
+/// How names are compared for one sort.
+#[derive(Clone, Copy)]
+enum Collation {
+    /// The C/POSIX locales: plain byte order.
+    Bytewise,
+    /// Byte-order shortcuts verified for the current locale, with `strcoll`
+    /// for everything else.
+    Fast(&'static AsciiOrder),
+    /// `strcoll` for every comparison.
+    Libc,
+}
+
+impl Collation {
+    fn for_len(len: usize) -> Self {
+        if locale_is_bytewise() {
+            Self::Bytewise
+        } else if let Some(order) = ASCII_ORDER.get() {
+            Self::Fast(order)
+        } else if len >= FAST_PATH_MIN {
+            Self::Fast(ascii_order())
+        } else {
+            Self::Libc
+        }
+    }
+
+    fn compare(self, a: &OsStr, b: &OsStr) -> Ordering {
+        match self {
+            Self::Bytewise => a.as_bytes().cmp(b.as_bytes()),
+            Self::Fast(order) => collate_fast(order, a, b),
+            Self::Libc => collate_slow(a, b),
+        }
+    }
+}
+
+/// Locale-aware comparison of two entry names, using shortcuts that were
+/// verified for the current locale by [`ascii_order`].
 ///
 /// Most real-world filenames are made up of lowercase ASCII letters and digits,
 /// for which byte order matches collation order in the common locales. Resolve
 /// those comparisons directly and only call into libc when the first differing
 /// byte falls outside that alphabet.
-pub fn collate_names(a: &OsStr, b: &OsStr) -> Ordering {
+fn collate_fast(order: &AsciiOrder, a: &OsStr, b: &OsStr) -> Ordering {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
-
-    // In the C/POSIX locales, collation is plain byte order for every name.
-    if ascii_order().bytewise_all {
-        return a_bytes.cmp(b_bytes);
-    }
-
     let common = a_bytes.len().min(b_bytes.len());
 
     let mut index = 0;
@@ -50,21 +87,21 @@ pub fn collate_names(a: &OsStr, b: &OsStr) -> Ordering {
         }
 
         // Locale collation is not required to preserve prefix order (e.g. a
-        // name sorting after its own extension). Probe the current locale once
-        // for a few representative bases; if any probe fails, disable the
-        // prefix shortcut entirely rather than guessing.
+        // name sorting after its own extension). The locale was probed once
+        // for a few representative bases; if any probe failed, the prefix
+        // shortcut is disabled entirely rather than guessed.
         let next = if a_bytes.len() == common {
             b_bytes[index]
         } else {
             a_bytes[index]
         };
-        if next.is_ascii() && ascii_order().prefix_sorts_first {
+        if next.is_ascii() && order.prefix_sorts_first {
             return a_bytes.len().cmp(&b_bytes.len());
         }
     } else {
         let left = a_bytes[index];
         let right = b_bytes[index];
-        if is_simple(left) && is_simple(right) && ascii_order().simple_is_bytewise {
+        if is_simple(left) && is_simple(right) && order.simple_is_bytewise {
             return left.cmp(&right);
         }
     }
@@ -77,31 +114,21 @@ fn is_simple(byte: u8) -> bool {
 }
 
 struct AsciiOrder {
-    /// The locale sorts every name by byte value.
-    bytewise_all: bool,
     /// `[0-9a-z]` compare in byte order.
     simple_is_bytewise: bool,
     /// A name sorts before any ASCII extension of itself.
     prefix_sorts_first: bool,
 }
 
-fn ascii_order() -> &'static AsciiOrder {
-    static ORDER: OnceLock<AsciiOrder> = OnceLock::new();
-    ORDER.get_or_init(|| {
-        if locale_is_bytewise() {
-            return AsciiOrder {
-                bytewise_all: true,
-                simple_is_bytewise: true,
-                prefix_sorts_first: true,
-            };
-        }
+static ASCII_ORDER: OnceLock<AsciiOrder> = OnceLock::new();
 
+fn ascii_order() -> &'static AsciiOrder {
+    ASCII_ORDER.get_or_init(|| {
         // Locales with multi-character collation elements (for example Czech
         // "ch") do not compose per-character order. Only probe locales where
         // ASCII order is plausibly stable.
         if !locale_has_simple_ascii_order() {
             return AsciiOrder {
-                bytewise_all: false,
                 simple_is_bytewise: false,
                 prefix_sorts_first: false,
             };
@@ -128,7 +155,6 @@ fn ascii_order() -> &'static AsciiOrder {
         });
 
         AsciiOrder {
-            bytewise_all: false,
             simple_is_bytewise,
             prefix_sorts_first,
         }
@@ -144,17 +170,20 @@ fn locale_name() -> Option<std::ffi::OsString> {
 
 /// The C and C.UTF-8 locales compare names byte by byte.
 fn locale_is_bytewise() -> bool {
-    let Some(name) = locale_name() else {
-        // No locale variables are set: the C locale.
-        return true;
-    };
-    let name = name.to_string_lossy();
+    static BYTEWISE: OnceLock<bool> = OnceLock::new();
+    *BYTEWISE.get_or_init(|| {
+        let Some(name) = locale_name() else {
+            // No locale variables are set: the C locale.
+            return true;
+        };
+        let name = name.to_string_lossy();
 
-    name == "C"
-        || name == "POSIX"
-        || name.eq_ignore_ascii_case("C.UTF-8")
-        || name.eq_ignore_ascii_case("C.utf8")
-        || name.eq_ignore_ascii_case("C.UTF8")
+        name == "C"
+            || name == "POSIX"
+            || name.eq_ignore_ascii_case("C.UTF-8")
+            || name.eq_ignore_ascii_case("C.utf8")
+            || name.eq_ignore_ascii_case("C.UTF8")
+    })
 }
 
 /// Return whether the locale selected by `setlocale(LC_ALL, "")` uses plain
@@ -205,7 +234,7 @@ fn collate_slow(a: &OsStr, b: &OsStr) -> Ordering {
     }
 }
 
-pub fn sort_entries(entries: &mut [Entry], opts: &Options) {
+pub fn sort_entries(entries: &mut Vec<Entry>, opts: &Options) {
     match opts.sort {
         SortKey::None => {}
         SortKey::Name => sort_names(entries),
@@ -224,8 +253,17 @@ pub fn sort_entries(entries: &mut [Entry], opts: &Options) {
     }
 
     if opts.dirs_first && opts.sort != SortKey::None {
-        entries.sort_by_key(|entry| !entry.file_type.is_dir());
+        group_directories_first(entries);
     }
+}
+
+/// Move directories to the front, keeping the existing order within both
+/// groups. This is a linear stable partition rather than a second sort.
+fn group_directories_first(entries: &mut Vec<Entry>) {
+    let others: Vec<Entry> = entries
+        .extract_if(.., |entry| !entry.file_type.is_dir())
+        .collect();
+    entries.extend(others);
 }
 
 fn sort_names(entries: &mut [Entry]) {
@@ -233,6 +271,9 @@ fn sort_names(entries: &mut [Entry]) {
     if pairs == 0 {
         return;
     }
+
+    let collation = Collation::for_len(entries.len());
+    let compare = |a: &Entry, b: &Entry| collation.compare(a.name.as_os_str(), b.name.as_os_str());
 
     // Sample adjacent pairs first. Readdir commonly returns names in nearly
     // sorted or reverse-sorted order, so avoid a full sort when a linear scan
@@ -242,7 +283,7 @@ fn sort_names(entries: &mut [Entry]) {
     let mut inversions = 0;
     let mut equal = 0;
     for pair in entries.windows(2).take(probe) {
-        match collate_names(pair[0].name.as_os_str(), pair[1].name.as_os_str()) {
+        match compare(&pair[0], &pair[1]) {
             Ordering::Greater => inversions += 1,
             Ordering::Equal => equal += 1,
             Ordering::Less => {}
@@ -264,10 +305,10 @@ fn sort_names(entries: &mut [Entry]) {
     // cheaper than sorting it, and on large directories it can be done in
     // parallel.
     if equal == 0 && inversions * 4 < probe {
-        if is_sorted(entries, false) {
+        if is_sorted(entries, collation, false) {
             return;
         }
-    } else if equal == 0 && inversions * 4 > probe * 3 && is_sorted(entries, true) {
+    } else if equal == 0 && inversions * 4 > probe * 3 && is_sorted(entries, collation, true) {
         entries.reverse();
         return;
     }
@@ -275,38 +316,30 @@ fn sort_names(entries: &mut [Entry]) {
     // Directory entry names are unique, so an unstable sort cannot change the
     // result. It avoids the merge buffer and copying that a stable sort needs.
     if entries.len() >= PARALLEL_SORT_THRESHOLD {
-        entries.par_sort_unstable_by(|a, b| collate_names(a.name.as_os_str(), b.name.as_os_str()));
+        entries.par_sort_unstable_by(compare);
     } else {
-        entries.sort_unstable_by(|a, b| collate_names(a.name.as_os_str(), b.name.as_os_str()));
+        entries.sort_unstable_by(compare);
     }
 }
 
 /// Check whether the entries are in ascending (or strictly descending) name
-/// order, using the locale-aware comparator.
-fn is_sorted(entries: &[Entry], descending: bool) -> bool {
-    let pairs = entries.len().saturating_sub(1);
+/// order.
+fn is_sorted(entries: &[Entry], collation: Collation, descending: bool) -> bool {
+    let in_order = |a: &Entry, b: &Entry| {
+        let ordering = collation.compare(a.name.as_os_str(), b.name.as_os_str());
+        if descending {
+            ordering == Ordering::Greater
+        } else {
+            ordering != Ordering::Greater
+        }
+    };
 
     if entries.len() >= PARALLEL_SORT_THRESHOLD {
-        (0..pairs).into_par_iter().all(|index| {
-            let ordering = collate_names(
-                entries[index].name.as_os_str(),
-                entries[index + 1].name.as_os_str(),
-            );
-            if descending {
-                ordering == Ordering::Greater
-            } else {
-                ordering != Ordering::Greater
-            }
-        })
+        (0..entries.len() - 1)
+            .into_par_iter()
+            .all(|index| in_order(&entries[index], &entries[index + 1]))
     } else {
-        entries.windows(2).all(|pair| {
-            let ordering = collate_names(pair[0].name.as_os_str(), pair[1].name.as_os_str());
-            if descending {
-                ordering == Ordering::Greater
-            } else {
-                ordering != Ordering::Greater
-            }
-        })
+        entries.windows(2).all(|pair| in_order(&pair[0], &pair[1]))
     }
 }
 

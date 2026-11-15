@@ -376,3 +376,114 @@ fn invalid_option_returns_status_2() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized option"));
 }
+
+#[test]
+fn long_format_reads_symlink_targets_inside_listed_directories() {
+    let dir = TestDir::new("symlink-dir");
+    fs::create_dir_all(dir.path().join("sub/deeper")).unwrap();
+    fs::write(dir.path().join("sub/target.txt"), "data").unwrap();
+    symlink("target.txt", dir.path().join("sub/link")).unwrap();
+    symlink("../target.txt", dir.path().join("sub/deeper/uplink")).unwrap();
+
+    // Targets are read relative to the listed directory, not the cwd.
+    let output = run(&dir, &["-l", "sub"]);
+    assert!(stdout(&output).contains(" link -> target.txt\n"));
+
+    // Recursion reaches nested directories through their parent's path.
+    let output = run(&dir, &["-lR", "sub"]);
+    let text = stdout(&output);
+    assert!(text.contains("sub/deeper:\n"));
+    assert!(text.contains(" uplink -> ../target.txt\n"));
+}
+
+#[test]
+fn color_marks_each_kind_without_long_format() {
+    let dir = TestDir::new("color-kinds");
+    fs::create_dir(dir.path().join("sub")).unwrap();
+    fs::write(dir.path().join("plain.txt"), "").unwrap();
+    fs::write(dir.path().join("run.sh"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(dir.path().join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    symlink("plain.txt", dir.path().join("link")).unwrap();
+    symlink("missing", dir.path().join("broken")).unwrap();
+
+    let output = run(&dir, &["--color=always", "-1"]);
+    let text = stdout(&output);
+
+    assert!(text.contains("\x1b[1;34msub\x1b[0m\n"));
+    assert!(text.contains("\x1b[1;32mrun.sh\x1b[0m\n"));
+    assert!(text.contains("\x1b[36mlink\x1b[0m\n"));
+    assert!(text.contains("\x1b[1;31mbroken\x1b[0m\n"));
+    assert!(text.lines().any(|line| line == "plain.txt"));
+}
+
+#[test]
+fn group_directories_first_keeps_order_within_groups() {
+    let dir = TestDir::new("dirs-first");
+    for name in ["a.txt", "c.txt", "e.txt"] {
+        fs::write(dir.path().join(name), "").unwrap();
+    }
+    for name in ["b", "d"] {
+        fs::create_dir(dir.path().join(name)).unwrap();
+    }
+
+    let output = run(&dir, &["-1", "--group-directories-first"]);
+    assert_eq!(stdout(&output), "b\nd\na.txt\nc.txt\ne.txt\n");
+
+    let output = run(&dir, &["-1r", "--group-directories-first"]);
+    assert_eq!(stdout(&output), "d\nb\ne.txt\nc.txt\na.txt\n");
+}
+
+/// Small directories are sorted with plain `strcoll` and large ones with
+/// byte-order shortcuts. Both must agree on every pair of names.
+#[test]
+fn small_and_large_directories_sort_consistently() {
+    let prefixes = [
+        "file", "File", "FILE", "_file", "file.", "file-", "a", "A", "b", "B", "z", "Z", "0", "9",
+        "$x", "café", "資料",
+    ];
+    let suffixes = [
+        "", "1", "10", "2", ".txt", ".TXT", "_x", "-y", " z", "a", "B",
+    ];
+    let mut names: std::collections::BTreeSet<String> = prefixes
+        .iter()
+        .flat_map(|prefix| {
+            suffixes
+                .iter()
+                .map(move |suffix| format!("{prefix}{suffix}"))
+        })
+        .collect();
+    names.extend((0..120).map(|index| format!("n{index}")));
+    let names: Vec<String> = names.into_iter().collect();
+    let subset: Vec<&String> = names.iter().step_by(10).collect();
+    assert!(names.len() >= 300 && subset.len() < 64);
+
+    let large = TestDir::new("collate-large");
+    let small = TestDir::new("collate-small");
+    for name in &names {
+        fs::write(large.path().join(name), "").unwrap();
+    }
+    for name in &subset {
+        fs::write(small.path().join(name), "").unwrap();
+    }
+
+    let list = |dir: &TestDir| {
+        let output = Command::new(env!("CARGO_BIN_EXE_ls"))
+            .arg("-1")
+            .current_dir(dir.path())
+            .env("LANG", "en_US.UTF-8")
+            .env_remove("LC_ALL")
+            .env_remove("LC_COLLATE")
+            .output()
+            .expect("failed to run ls");
+        assert!(output.status.success());
+        stdout(&output)
+    };
+
+    let large_order = list(&large);
+    let small_order = list(&small);
+    let expected: Vec<&str> = large_order
+        .lines()
+        .filter(|line| subset.iter().any(|name| name.as_str() == *line))
+        .collect();
+    assert_eq!(small_order.lines().collect::<Vec<_>>(), expected);
+}

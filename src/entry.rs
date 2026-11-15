@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::fs::Metadata;
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
@@ -141,14 +142,16 @@ impl EntryMeta {
     }
 }
 
-/// A single directory entry with its name, path, and (optionally loaded) metadata.
+/// A single directory entry with its name and (optionally loaded) metadata.
 pub struct Entry {
     pub name: OsString,
-    pub path: PathBuf,
+    /// Contents of the symlink, read while loading entries when the long
+    /// format will display it.
+    pub link_target: Option<OsString>,
     pub file_type: EntryType,
     pub meta: Option<EntryMeta>,
     /// Kind of the symlink target, when color output required resolving it.
-    pub target: Option<Kind>,
+    pub target_kind: Option<Kind>,
 }
 
 impl Entry {
@@ -159,31 +162,65 @@ impl Entry {
     }
 }
 
-/// Returns `true` when the entry's metadata must be loaded.
-pub fn needs_metadata(opts: &Options, color: bool) -> bool {
+/// Returns `true` when every entry's metadata must be loaded, because a
+/// column or the sort key reads it.
+fn needs_metadata(opts: &Options) -> bool {
     opts.long
         || opts.blocks
         || opts.inode
         || opts.sort == SortKey::Time
         || opts.sort == SortKey::Size
-        || opts.indicator == IndicatorStyle::Classify
-        || color
+}
+
+/// Returns `true` when the permission bits of regular files are needed:
+/// color and `-F` both mark executables. Other kinds are fully described by
+/// their file type.
+fn needs_file_mode(opts: &Options, color: bool) -> bool {
+    color || opts.indicator == IndicatorStyle::Classify
+}
+
+/// Returns `true` when loading entries may cost a syscall per entry, so it
+/// is worth spreading the work across threads.
+pub fn may_stat(opts: &Options, color: bool) -> bool {
+    needs_metadata(opts) || needs_file_mode(opts, color)
 }
 
 /// Returns `true` when the entry's file type is needed even without full metadata.
-pub fn needs_type(opts: &Options, color: bool) -> bool {
-    needs_metadata(opts, color)
+fn needs_type(opts: &Options, color: bool) -> bool {
+    may_stat(opts, color)
         || opts.recursive
         || opts.dirs_first
         || opts.indicator != IndicatorStyle::None
 }
 
-fn stat_at(dir_fd: RawFd, name: &OsString, flags: AtFlags) -> io::Result<EntryMeta> {
+/// Returns `true` when `build_entry` must `lstat` an entry whose directory
+/// record reported `dirent_type`.
+fn needs_stat(opts: &Options, color: bool, dirent_type: EntryType) -> bool {
+    match dirent_type {
+        _ if needs_metadata(opts) => true,
+        EntryType::Regular => needs_file_mode(opts, color),
+        EntryType::Unknown => needs_type(opts, color),
+        _ => false,
+    }
+}
+
+fn borrow_dir_fd<'fd>(dir_fd: RawFd) -> BorrowedFd<'fd> {
     // The directory reader stays alive for the whole metadata-loading phase,
     // so the descriptor is valid for every call.
-    let dir_fd = unsafe { BorrowedFd::borrow_raw(dir_fd) };
-    let stat = rustix::fs::statat(dir_fd, name, flags)?;
+    unsafe { BorrowedFd::borrow_raw(dir_fd) }
+}
+
+fn stat_at(dir_fd: RawFd, name: &OsString, flags: AtFlags) -> io::Result<EntryMeta> {
+    let stat = rustix::fs::statat(borrow_dir_fd(dir_fd), name, flags)?;
     Ok(EntryMeta::from_stat(&stat))
+}
+
+/// Read a symlink relative to its directory, avoiding a full path lookup.
+/// Unreadable links are shown without a target, as before.
+fn read_link_at(dir_fd: RawFd, name: &OsString) -> Option<OsString> {
+    rustix::fs::readlinkat(borrow_dir_fd(dir_fd), name, Vec::new())
+        .ok()
+        .map(|target| OsString::from_vec(target.into_bytes()))
 }
 
 /// Turn a raw directory entry into an `Entry`, loading metadata when requested.
@@ -196,9 +233,9 @@ pub fn build_entry(
     opts: &Options,
     color: bool,
 ) -> Result<Entry, (PathBuf, io::Error)> {
-    let RawEntry { name, file_type: dirent_file_type } = raw;
+    let RawEntry { name, file_type: dirent_type } = raw;
 
-    let metadata = if needs_metadata(opts, color) {
+    let metadata = if needs_stat(opts, color, dirent_type) {
         match stat_at(dir_fd, &name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(meta) => Some(meta),
             Err(err) => return Err((dir_path.join(&name), err)),
@@ -209,26 +246,15 @@ pub fn build_entry(
 
     let file_type = match &metadata {
         Some(meta) => EntryType::from_mode(meta.mode),
-        None if dirent_file_type == EntryType::Unknown && needs_type(opts, color) => {
-            match stat_at(dir_fd, &name, AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(meta) => EntryType::from_mode(meta.mode),
-                Err(err) => return Err((dir_path.join(&name), err)),
-            }
-        }
-        None => dirent_file_type,
+        None => dirent_type,
     };
 
-    // Building the full path costs an allocation per entry. It is only needed
-    // for recursive descent into directories and for resolving symlinks in
-    // long/color output.
-    let needs_path =
-        (opts.recursive && file_type.is_dir()) || ((opts.long || color) && file_type.is_symlink());
-    let entry_path = if needs_path {
-        dir_path.join(&name)
+    let link_target = if opts.long && file_type.is_symlink() {
+        read_link_at(dir_fd, &name)
     } else {
-        PathBuf::new()
+        None
     };
-    let target = if color && file_type.is_symlink() {
+    let target_kind = if color && file_type.is_symlink() {
         stat_at(dir_fd, &name, AtFlags::empty())
             .ok()
             .map(|meta| kind_of(EntryType::from_mode(meta.mode), Some(meta.mode)))
@@ -238,10 +264,10 @@ pub fn build_entry(
 
     Ok(Entry {
         name,
-        path: entry_path,
+        link_target,
         file_type,
         meta: metadata,
-        target,
+        target_kind,
     })
 }
 
@@ -265,7 +291,7 @@ pub fn kind_of(file_type: EntryType, mode: Option<u32>) -> Kind {
 
 pub fn entry_kind(entry: &Entry) -> Kind {
     if entry.file_type.is_symlink() {
-        if entry.target.is_some() {
+        if entry.target_kind.is_some() {
             Kind::Link
         } else {
             Kind::Broken
