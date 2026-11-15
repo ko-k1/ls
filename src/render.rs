@@ -352,7 +352,7 @@ impl<'a> Renderer<'a> {
                     push_format_blocks(meta.blocks, true, &mut scratch);
                     width_blocks = width_blocks.max(scratch.len());
                 } else {
-                    width_blocks = width_blocks.max(decimal_width(meta.blocks / 2));
+                    width_blocks = width_blocks.max(decimal_width(meta.blocks.div_ceil(2)));
                 }
             }
 

@@ -58,14 +58,43 @@ mod tests {
     use crate::time::{civil_from_days, format_time_at, utc_datetime, DateTime};
 
     #[test]
-    fn human_sizes() {
-        assert_eq!(human_size(0), "0");
-        assert_eq!(human_size(512), "512");
-        assert_eq!(human_size(1024), "1.0K");
-        assert_eq!(human_size(1536), "1.5K");
-        assert_eq!(human_size(10 * 1024), "10K");
-        assert_eq!(human_size(1024 * 1024), "1.0M");
-        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0G");
+    fn human_sizes_match_gnu_ls() {
+        // Expected values were produced by GNU coreutils 9.12 `ls -lh` on
+        // sparse files of each size. GNU rounds up, never to nearest.
+        let cases: &[(u64, &str)] = &[
+            (0, "0"),
+            (1, "1"),
+            (512, "512"),
+            (1023, "1023"),
+            (1024, "1.0K"),
+            (1025, "1.1K"),
+            (1030, "1.1K"),
+            (1536, "1.5K"),
+            (2047, "2.0K"),
+            (10188, "10K"),
+            (10230, "10K"),
+            (10239, "10K"),
+            (10240, "10K"),
+            (10241, "11K"),
+            (10300, "11K"),
+            (102399, "100K"),
+            (1047552, "1023K"),
+            (1048064, "1.0M"),
+            (1048575, "1.0M"),
+            (1048576, "1.0M"),
+            (1048577, "1.1M"),
+            (10433331, "10M"),
+            (10485248, "10M"),
+            (1073741824, "1.0G"),
+            (3221225472, "3.0G"),
+            (1099511627777, "1.1T"),
+            (1152921504606846976, "1.0E"),
+            (9223372036854775807, "8.0E"),
+            (u64::MAX, "16E"),
+        ];
+        for &(bytes, expected) in cases {
+            assert_eq!(human_size(bytes), expected, "human_size({bytes})");
+        }
     }
 
     #[test]
@@ -118,11 +147,19 @@ mod tests {
 
     #[test]
     fn block_counts_match_gnu_units() {
+        // GNU ls reports 1024-byte units rounded up (checked against
+        // coreutils 9.12 with faked odd st_blocks values).
         assert_eq!(format_blocks(0, false), "0");
-        assert_eq!(format_blocks(1, false), "0");
+        assert_eq!(format_blocks(1, false), "1");
+        assert_eq!(format_blocks(3, false), "2");
         assert_eq!(format_blocks(8, false), "4");
+        assert_eq!(format_blocks(2047, false), "1024");
         assert_eq!(format_blocks(8, true), "4.0K");
         assert_eq!(format_blocks(1, true), "512");
+        assert_eq!(format_blocks(3, true), "1.5K");
+        assert_eq!(format_blocks(2047, true), "1.0M");
+        assert_eq!(format_blocks(2049, true), "1.1M");
+        assert_eq!(format_blocks(20479, true), "10M");
     }
 
     #[test]
