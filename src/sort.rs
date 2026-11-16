@@ -6,7 +6,7 @@ use rayon::prelude::*;
 
 use crate::args::{Options, SortKey};
 use crate::collate::{self, KeyMode};
-use crate::entry::Entry;
+use crate::entry::{Entry, Kind};
 
 const PARALLEL_SORT_THRESHOLD: usize = 8 * 1024;
 
@@ -47,11 +47,14 @@ pub fn sort_entries(entries: &mut Vec<&Entry<'_>>, opts: &Options) {
     }
 }
 
-/// Move directories to the front, keeping the existing order within both
-/// groups. This is a linear stable partition rather than a second sort.
+/// Move directories, and symlinks to directories (as GNU ls does), to the
+/// front, keeping the existing order within both groups. This is a linear
+/// stable partition rather than a second sort.
 fn group_directories_first(entries: &mut Vec<&Entry<'_>>) {
     let others: Vec<&Entry<'_>> = entries
-        .extract_if(.., |entry| !entry.file_type.is_dir())
+        .extract_if(.., |entry| {
+            !(entry.file_type.is_dir() || entry.target_kind == Some(Kind::Dir))
+        })
         .collect();
     entries.extend(others);
 }

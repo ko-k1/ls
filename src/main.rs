@@ -58,7 +58,9 @@ mod tests {
     use crate::collate::{KeyMode, Level1Table};
     use crate::quoting::quote_name;
     use crate::sizes::{format_blocks, human_size};
-    use crate::time::{civil_from_days, format_time_at, utc_datetime, DateTime};
+    use crate::time::{
+        civil_from_days, format_time_at, is_recent, utc_datetime, DateTime, Timestamp,
+    };
 
     #[test]
     fn human_sizes_match_gnu_ls() {
@@ -146,6 +148,29 @@ mod tests {
             format_time_at(now + 60, now, utc_datetime(now + 60)),
             "Nov 14  2023"
         );
+    }
+
+    #[test]
+    fn recency_compares_nanoseconds_like_gnu_ls() {
+        let at = |seconds, nanoseconds| Timestamp {
+            seconds,
+            nanoseconds,
+        };
+        let now = at(1_700_000_100, 900_000_000);
+        // Modified earlier within the same second: a time of day, not a year.
+        assert!(is_recent(at(1_700_000_100, 300_000_000), now));
+        assert!(!is_recent(now, now));
+        assert!(!is_recent(at(1_700_000_100, 900_000_001), now));
+        // Exactly six months old is no longer recent; a nanosecond less is.
+        let half_year = 15_778_476;
+        assert!(!is_recent(
+            at(now.seconds - half_year, now.nanoseconds),
+            now
+        ));
+        assert!(is_recent(
+            at(now.seconds - half_year, now.nanoseconds + 1),
+            now
+        ));
     }
 
     #[test]

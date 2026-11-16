@@ -768,3 +768,83 @@ fn large_long_listing_aligns_columns_across_chunks() {
         assert!(row.ends_with(&format!(" f{index:05}")), "{row}");
     }
 }
+
+#[test]
+fn operands_are_sorted_like_gnu() {
+    let dir = TestDir::new("operand-order");
+    for name in ["c.txt", "a.txt", "b.txt"] {
+        fs::write(dir.path().join(name), name.repeat(10)).unwrap();
+    }
+    fs::write(dir.path().join("big"), vec![b'x'; 4000]).unwrap();
+    for name in ["zdir", "adir"] {
+        fs::create_dir(dir.path().join(name)).unwrap();
+        fs::write(dir.path().join(name).join("inner"), "").unwrap();
+    }
+
+    let output = run(&dir, &["-1", "c.txt", "zdir", "a.txt", "adir", "b.txt"]);
+    assert_eq!(
+        stdout(&output),
+        "a.txt\nb.txt\nc.txt\n\nadir:\ninner\n\nzdir:\ninner\n"
+    );
+
+    let output = run(&dir, &["-1S", "a.txt", "big", "b.txt"]);
+    assert_eq!(stdout(&output), "big\na.txt\nb.txt\n");
+}
+
+#[test]
+fn block_column_is_aligned_outside_long_format() {
+    let dir = TestDir::new("blocks-aligned");
+    fs::write(dir.path().join("empty"), "").unwrap();
+    fs::write(dir.path().join("large"), vec![b'x'; 200_000]).unwrap();
+
+    let output = run(&dir, &["-1s"]);
+    let text = stdout(&output);
+    let rows: Vec<&str> = text.lines().skip(1).collect();
+    let starts: Vec<usize> = rows
+        .iter()
+        .map(|row| row.len() - row.trim_start().split_once(' ').unwrap().1.len())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(starts[0], starts[1], "names not aligned: {rows:?}");
+    assert!(
+        rows[0].starts_with(' '),
+        "small count not right-aligned: {rows:?}"
+    );
+}
+
+#[test]
+fn group_directories_first_includes_symlinks_to_directories() {
+    let dir = TestDir::new("dirs-first-links");
+    fs::create_dir(dir.path().join("real")).unwrap();
+    fs::write(dir.path().join("file"), "").unwrap();
+    symlink("real", dir.path().join("alias")).unwrap();
+    symlink("missing", dir.path().join("broken")).unwrap();
+
+    for args in [
+        ["-1", "--group-directories-first"],
+        ["-l", "--group-directories-first"],
+    ] {
+        let output = run(&dir, &args);
+        let names: Vec<String> = stdout(&output)
+            .lines()
+            .filter(|line| !line.starts_with("total"))
+            .map(|line| {
+                let line = line.split(" -> ").next().unwrap();
+                line.rsplit(' ').next().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(names, ["alias", "real", "broken", "file"], "{args:?}");
+    }
+}
+
+#[test]
+fn file_modified_just_now_shows_time_of_day() {
+    let dir = TestDir::new("fresh");
+    fs::write(dir.path().join("new"), "").unwrap();
+
+    let output = run(&dir, &["-l", "new"]);
+    let text = stdout(&output);
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    let time = fields[fields.len() - 2];
+    assert!(time.contains(':'), "expected a time of day, got {text:?}");
+}

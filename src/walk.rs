@@ -53,6 +53,14 @@ pub fn walk(
 
     thread::scope(|scope| {
         let mut workers = 0;
+        // With several operands, start workers on all but the first before
+        // the main thread lists it, so a large first directory (operands are
+        // sorted, so it is not necessarily the first given) does not delay
+        // the others.
+        while workers < max_workers && workers + 1 < roots.len() {
+            scope.spawn(|| walk.work());
+            workers += 1;
+        }
         let mut stack: Vec<Arc<Node>> = roots.into_iter().rev().collect();
         while let Some(node) = stack.pop() {
             let (listing, children) = walk.take(&node);

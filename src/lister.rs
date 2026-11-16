@@ -134,44 +134,13 @@ impl Lister {
         let follow_operand_symlink = !self.settings.opts.directory
             && !self.settings.opts.long
             && self.settings.opts.indicator != IndicatorStyle::Classify;
-        let mut files = Vec::new();
-        let mut dirs = Vec::new();
-
+        // Every operand becomes an entry so that files and directories are
+        // sorted together by the active sort key, as GNU ls does.
+        let opts = &self.settings.opts;
+        let mut entries = Vec::new();
         for operand in &operands {
-            match fs::symlink_metadata(operand) {
-                Ok(meta) => {
-                    let mut is_dir = meta.is_dir();
-                    if !is_dir && follow_operand_symlink && meta.file_type().is_symlink() {
-                        is_dir = fs::metadata(operand)
-                            .map(|target| target.is_dir())
-                            .unwrap_or(false);
-                    }
-
-                    if is_dir && !self.settings.opts.directory {
-                        dirs.push(operand.clone());
-                    } else {
-                        let file_type = EntryType::from_mode(meta.mode());
-                        let target_kind = if self.settings.color && file_type.is_symlink() {
-                            fs::metadata(operand).ok().map(|target| {
-                                kind_of(EntryType::from_mode(target.mode()), Some(target.mode()))
-                            })
-                        } else {
-                            None
-                        };
-                        let link_target = if self.settings.opts.long && file_type.is_symlink() {
-                            fs::read_link(operand).ok().map(PathBuf::into_os_string)
-                        } else {
-                            None
-                        };
-                        files.push(Entry {
-                            name: operand.as_os_str(),
-                            link_target,
-                            file_type,
-                            meta: Some(EntryMeta::from_metadata(&meta)),
-                            target_kind,
-                        });
-                    }
-                }
+            let meta = match fs::symlink_metadata(operand) {
+                Ok(meta) => meta,
                 Err(err) => {
                     self.output.serious_error = true;
                     eprintln!(
@@ -179,15 +148,62 @@ impl Lister {
                         quote_for_message(&operand.to_string_lossy()),
                         err
                     );
+                    continue;
                 }
-            }
+            };
+            // A symlink to a directory is listed as that directory (using
+            // the directory's metadata) unless -d, -l or -F says otherwise.
+            let meta = match follow_operand_symlink && meta.file_type().is_symlink() {
+                true => fs::metadata(operand)
+                    .ok()
+                    .filter(|target| target.is_dir())
+                    .unwrap_or(meta),
+                false => meta,
+            };
+            let file_type = EntryType::from_mode(meta.mode());
+            let target_kind = if (self.settings.color || opts.dirs_first) && file_type.is_symlink()
+            {
+                fs::metadata(operand)
+                    .ok()
+                    .map(|target| kind_of(EntryType::from_mode(target.mode()), Some(target.mode())))
+            } else {
+                None
+            };
+            let link_target = if opts.long && file_type.is_symlink() {
+                fs::read_link(operand).ok().map(PathBuf::into_os_string)
+            } else {
+                None
+            };
+            entries.push(Entry {
+                name: operand.as_os_str(),
+                link_target,
+                file_type,
+                meta: Some(EntryMeta::from_metadata(&meta)),
+                target_kind,
+            });
         }
+
+        let mut sorted: Vec<&Entry> = entries.iter().collect();
+        if sorted.len() > 1 {
+            sort_entries(&mut sorted, opts);
+        }
+        let listed = |entry: &&Entry| entry.file_type.is_dir() && !opts.directory;
+        let files: Vec<&Entry> = sorted
+            .iter()
+            .copied()
+            .filter(|entry| !listed(entry))
+            .collect();
+        let dirs: Vec<PathBuf> = sorted
+            .iter()
+            .filter(|entry| listed(entry))
+            .map(|entry| PathBuf::from(entry.name))
+            .collect();
 
         if !files.is_empty() {
             let mut rendered = Vec::new();
             let settings = &self.settings;
             Renderer::new(&settings.opts, settings.color, settings.tty, &mut rendered)
-                .print_entries(&files.iter().collect::<Vec<_>>(), false);
+                .print_operands(&files, &sorted);
             self.output.write(&rendered);
             self.output.first_block = false;
         }
@@ -291,7 +307,7 @@ pub fn list_dir(settings: &Settings, path: &Path, serious: bool) -> DirListing {
         .chain(loaded.iter().filter_map(|item| item.as_ref().ok()))
         .collect();
     sort_entries(&mut sorted, opts);
-    Renderer::new(opts, color, settings.tty, &mut listing.output).print_entries(&sorted, true);
+    Renderer::new(opts, color, settings.tty, &mut listing.output).print_entries(&sorted);
 
     if opts.recursive {
         listing.subdirs = sorted

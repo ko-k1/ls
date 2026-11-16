@@ -16,11 +16,38 @@ pub struct DateTime {
     pub minute: i64,
 }
 
-pub fn now_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+/// A file or clock time with nanosecond precision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Timestamp {
+    pub seconds: i64,
+    pub nanoseconds: i64,
+}
+
+impl Timestamp {
+    pub fn now() -> Self {
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Self {
+            seconds: since_epoch.as_secs() as i64,
+            nanoseconds: i64::from(since_epoch.subsec_nanos()),
+        }
+    }
+}
+
+/// Average Gregorian half year, in seconds (as GNU ls uses).
+const HALF_YEAR: i64 = 15_778_476;
+
+/// Whether `when` is shown with a time of day rather than a year: newer
+/// than six months before `now` and older than `now`, compared to the
+/// nanosecond like GNU ls. (Comparing whole seconds showed a year for
+/// files modified within the current second.)
+pub fn is_recent(when: Timestamp, now: Timestamp) -> bool {
+    let six_months_ago = Timestamp {
+        seconds: now.seconds - HALF_YEAR,
+        nanoseconds: now.nanoseconds,
+    };
+    six_months_ago < when && when < now
 }
 
 pub fn utc_datetime(seconds: i64) -> DateTime {
@@ -213,17 +240,21 @@ fn day_offset(day: i64) -> Option<i64> {
 /// Format the timestamp for `seconds` relative to `now`.
 #[allow(dead_code)] // used by the unit tests in src/main.rs
 pub fn format_time_at(seconds: i64, now: i64, datetime: DateTime) -> String {
+    let at = |seconds| Timestamp {
+        seconds,
+        nanoseconds: 0,
+    };
     let mut out = String::new();
-    push_format_time_at(seconds, now, datetime, &mut out);
+    push_format_time_at(datetime, is_recent(at(seconds), at(now)), &mut out);
     out
 }
 
-/// Write the formatted timestamp into `out`, reusing `out`'s capacity.
-pub fn push_format_time_at(seconds: i64, now: i64, datetime: DateTime, out: &mut String) {
+/// Write the formatted timestamp into `out`, reusing `out`'s capacity:
+/// month, day, and then the time of day if `recent`, else the year.
+pub fn push_format_time_at(datetime: DateTime, recent: bool, out: &mut String) {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    const HALF_YEAR: i64 = 15_778_476;
 
     out.clear();
     out.push_str(MONTHS[(datetime.month - 1) as usize]);
@@ -236,7 +267,7 @@ pub fn push_format_time_at(seconds: i64, now: i64, datetime: DateTime, out: &mut
         push_two_digits(out, datetime.day as u8);
     }
 
-    if seconds < now && now - seconds <= HALF_YEAR {
+    if recent {
         out.push(' ');
         push_two_digits(out, datetime.hour as u8);
         out.push(':');

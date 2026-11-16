@@ -99,6 +99,30 @@ pub fn is_plain_ascii(name: &[u8]) -> bool {
             .all(|&byte| PLAIN.get(usize::from(byte)) == Some(&true))
 }
 
+/// Whether `quote_name(name, true)` changes the name (quotes or escapes
+/// it), decided from the bytes without building the quoted form.
+///
+/// Outside ASCII, `char::is_control` is true only for U+0080..=U+009F, and
+/// `char::is_whitespace` for a short fixed list, so only those characters
+/// need decoding. Names that are not valid UTF-8 are displayed escaped.
+pub fn needs_terminal_quoting(name: &[u8]) -> bool {
+    if is_plain_ascii(name) {
+        return false;
+    }
+    if name
+        .iter()
+        .any(|&byte| byte.is_ascii() && ascii_needs_quoting(byte))
+    {
+        return true;
+    }
+    match std::str::from_utf8(name) {
+        Err(_) => true,
+        Ok(text) => text
+            .chars()
+            .any(|ch| !ch.is_ascii() && (ch.is_control() || ch.is_whitespace())),
+    }
+}
+
 /// [`needs_shell_quoting`] for a single ASCII character.
 const fn ascii_needs_quoting(byte: u8) -> bool {
     byte < 0x20
@@ -186,5 +210,47 @@ mod tests {
         }
         assert!(!is_plain_ascii("café".as_bytes()));
         assert!(!is_plain_ascii(b""));
+    }
+
+    #[test]
+    fn terminal_quoting_check_matches_quote_name() {
+        let changed = |name: &[u8]| match std::str::from_utf8(name) {
+            Ok(text) => matches!(quote_name(text, true), std::borrow::Cow::Owned(_)),
+            Err(_) => true,
+        };
+        let names: &[&[u8]] = &[
+            b"plain.txt",
+            b"with space",
+            "café".as_bytes(),
+            "資料_2024（1）".as_bytes(),
+            "写真 2".as_bytes(),
+            "nbsp\u{a0}here".as_bytes(),
+            "ideographic\u{3000}space".as_bytes(),
+            "c1\u{85}control".as_bytes(),
+            "line\u{2028}sep".as_bytes(),
+            "メモ$".as_bytes(),
+            "e\u{301}".as_bytes(),
+            b"bad\xffutf8",
+            b"tab\there",
+        ];
+        for name in names {
+            assert_eq!(
+                needs_terminal_quoting(name),
+                changed(name),
+                "{:?}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        // Every code point up to U+FFFF, embedded in an otherwise plain name.
+        for code in 0x80u32..0x1_0000 {
+            if let Some(ch) = char::from_u32(code) {
+                let text = format!("a{ch}b");
+                assert_eq!(
+                    needs_terminal_quoting(text.as_bytes()),
+                    changed(text.as_bytes()),
+                    "U+{code:04X}"
+                );
+            }
+        }
     }
 }

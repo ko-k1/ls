@@ -13,9 +13,11 @@ use crate::format::{
 use crate::ids::{group_map, user_map};
 use crate::layout::{display_width, layout_columns};
 use crate::permissions::push_permissions;
-use crate::quoting::{is_plain_ascii, quote_name};
+use crate::quoting::{is_plain_ascii, needs_terminal_quoting, quote_name};
 use crate::sizes::{format_blocks, push_format_blocks, push_human_size};
-use crate::time::{local_time, now_seconds, push_format_time_at, terminal_width, DayOffsets};
+use crate::time::{
+    is_recent, local_time, push_format_time_at, terminal_width, DayOffsets, Timestamp,
+};
 
 /// Listings with at least this many entries are rendered in parallel chunks.
 const PARALLEL_RENDER: usize = 4 * 1024;
@@ -47,21 +49,76 @@ impl<'a> Renderer<'a> {
         self.out.push(b'\n');
     }
 
-    pub fn print_entries(&mut self, entries: &[&Entry<'_>], from_directory: bool) {
-        if from_directory && (self.opts.long || self.opts.blocks) {
+    /// Render a directory's entries, preceded by its block total.
+    pub fn print_entries(&mut self, entries: &[&Entry<'_>]) {
+        if self.opts.long || self.opts.blocks {
             let total: u64 = entries.iter().map(|entry| entry.metadata().blocks).sum();
             self.write_line(&format!("total {}", format_blocks(total, self.opts.human)));
         }
+        self.print_batch(entries, entries);
+    }
 
+    /// Render the command-line file operands. Like GNU ls, column widths
+    /// and quote alignment account for every operand, including the
+    /// directories listed separately afterwards.
+    pub fn print_operands(&mut self, files: &[&Entry<'_>], all: &[&Entry<'_>]) {
+        self.print_batch(files, all);
+    }
+
+    /// Render `entries`, sizing padded columns over `measured` (a superset).
+    fn print_batch(&mut self, entries: &[&Entry<'_>], measured: &[&Entry<'_>]) {
         if entries.is_empty() {
             return;
         }
-
+        let quote_pad = self.quote_pad(measured);
         if self.opts.long {
-            self.print_long(entries);
+            self.print_long(entries, measured, quote_pad);
         } else {
-            self.print_short(entries);
+            let batch = Batch {
+                inode_width: if self.opts.inode {
+                    measured
+                        .iter()
+                        .map(|entry| decimal_width(entry.metadata().ino))
+                        .max()
+                        .unwrap_or(0)
+                } else {
+                    0
+                },
+                blocks_width: if self.opts.blocks {
+                    let mut scratch = String::new();
+                    measured
+                        .iter()
+                        .map(|entry| {
+                            push_format_blocks(
+                                entry.metadata().blocks,
+                                self.opts.human,
+                                &mut scratch,
+                            );
+                            scratch.len()
+                        })
+                        .max()
+                        .unwrap_or(0)
+                } else {
+                    0
+                },
+                quote_pad,
+            };
+            self.print_short(entries, &batch);
         }
+    }
+
+    /// Whether unquoted names get a leading space so they line up with
+    /// quoted ones. GNU ls does this in terminal column and long output
+    /// (not `-1`) when any name in the batch needs quoting.
+    fn quote_pad(&self, measured: &[&Entry<'_>]) -> bool {
+        let quoted = |entry: &&Entry<'_>| needs_terminal_quoting(entry.name.as_bytes());
+        self.tty
+            && (self.opts.long || !self.opts.one_per_line)
+            && if measured.len() < PARALLEL_RENDER {
+                measured.iter().any(quoted)
+            } else {
+                measured.par_iter().any(quoted)
+            }
     }
 
     fn suffix(&self, entry: &Entry<'_>) -> &'static str {
@@ -109,9 +166,12 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn push_name(&self, out: &mut String, entry: &Entry<'_>) {
+    fn push_name(&self, out: &mut String, entry: &Entry<'_>, quote_pad: bool) {
         let kind = entry_kind(entry);
         let name = Self::quoted_name(entry, self.tty);
+        if quote_pad && matches!(name, Cow::Borrowed(_)) {
+            out.push(' ');
+        }
         if self.color {
             push_paint(out, kind, &name);
         } else {
@@ -127,19 +187,17 @@ impl<'a> Renderer<'a> {
         text: &mut Vec<u8>,
         entry: &Entry<'_>,
         scratch: &mut String,
+        batch: &Batch,
     ) -> usize {
         let start = text.len();
-        if self.opts.inode {
-            push_u64_bytes(text, entry.metadata().ino);
-            text.push(b' ');
-        }
-        if self.opts.blocks {
-            push_format_blocks(entry.metadata().blocks, self.opts.human, scratch);
-            text.extend_from_slice(scratch.as_bytes());
-            text.push(b' ');
-        }
+        self.push_number_prefixes(text, entry, scratch, batch);
         // Prefixes and indicators are ASCII: one column per byte.
         let mut width = text.len() - start;
+        let plain = is_plain_ascii(entry.name.as_bytes());
+        if batch.quote_pad && !needs_terminal_quoting(entry.name.as_bytes()) {
+            text.push(b' ');
+            width += 1;
+        }
 
         let code = self.color.then(|| color_code(entry_kind(entry))).flatten();
         if let Some(code) = code {
@@ -148,7 +206,7 @@ impl<'a> Renderer<'a> {
             text.push(b'm');
         }
         let name = entry.name.as_bytes();
-        if is_plain_ascii(name) {
+        if plain {
             text.extend_from_slice(name);
             width += name.len();
         } else {
@@ -165,57 +223,70 @@ impl<'a> Renderer<'a> {
         width + suffix.len()
     }
 
-    fn stream_short(&mut self, entries: &[&Entry<'_>]) {
-        if self.tty {
-            self.stream_short_text(entries);
-        } else {
-            self.stream_short_bytes(entries);
+    /// Append the inode and block-count prefixes, right-aligned to the
+    /// batch's widths as GNU ls does outside the long format too.
+    fn push_number_prefixes(
+        &self,
+        out: &mut Vec<u8>,
+        entry: &Entry<'_>,
+        scratch: &mut String,
+        batch: &Batch,
+    ) {
+        if self.opts.inode {
+            let ino = entry.metadata().ino;
+            out.resize(
+                out.len() + batch.inode_width.saturating_sub(decimal_width(ino)),
+                b' ',
+            );
+            push_u64_bytes(out, ino);
+            out.push(b' ');
+        }
+        if self.opts.blocks {
+            push_format_blocks(entry.metadata().blocks, self.opts.human, scratch);
+            out.resize(
+                out.len() + batch.blocks_width.saturating_sub(scratch.len()),
+                b' ',
+            );
+            out.extend_from_slice(scratch.as_bytes());
+            out.push(b' ');
         }
     }
 
-    fn stream_short_text(&mut self, entries: &[&Entry<'_>]) {
+    fn stream_short(&mut self, entries: &[&Entry<'_>], batch: &Batch) {
+        if self.tty {
+            self.stream_short_text(entries, batch);
+        } else {
+            self.stream_short_bytes(entries, batch);
+        }
+    }
+
+    fn stream_short_text(&mut self, entries: &[&Entry<'_>], batch: &Batch) {
+        let mut prefix = Vec::with_capacity(64);
         let mut line = String::with_capacity(512);
         let mut scratch = String::new();
 
         for entry in entries {
+            prefix.clear();
+            self.push_number_prefixes(&mut prefix, entry, &mut scratch, batch);
             line.clear();
-
-            if self.opts.inode {
-                push_u64(&mut line, entry.metadata().ino);
-                line.push(' ');
-            }
-            if self.opts.blocks {
-                push_format_blocks(entry.metadata().blocks, self.opts.human, &mut scratch);
-                line.push_str(&scratch);
-                line.push(' ');
-            }
-
-            self.push_name(&mut line, entry);
+            self.push_name(&mut line, entry, false);
             line.push_str(self.suffix(entry));
             line.push('\n');
 
+            self.out.extend_from_slice(&prefix);
             self.out.extend_from_slice(line.as_bytes());
         }
     }
 
     /// Piped output does not need UTF-8 conversion: write filename bytes
     /// through and only protect record boundaries.
-    fn stream_short_bytes(&mut self, entries: &[&Entry<'_>]) {
+    fn stream_short_bytes(&mut self, entries: &[&Entry<'_>], batch: &Batch) {
         let mut line = Vec::with_capacity(512);
         let mut scratch = String::new();
 
         for entry in entries {
             line.clear();
-
-            if self.opts.inode {
-                push_u64_bytes(&mut line, entry.metadata().ino);
-                line.push(b' ');
-            }
-            if self.opts.blocks {
-                push_format_blocks(entry.metadata().blocks, self.opts.human, &mut scratch);
-                line.extend_from_slice(scratch.as_bytes());
-                line.push(b' ');
-            }
+            self.push_number_prefixes(&mut line, entry, &mut scratch, batch);
 
             self.push_name_bytes(&mut line, entry);
             line.extend_from_slice(self.suffix(entry).as_bytes());
@@ -252,9 +323,9 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn print_short(&mut self, entries: &[&Entry<'_>]) {
+    fn print_short(&mut self, entries: &[&Entry<'_>], batch: &Batch) {
         if self.opts.one_per_line || !self.tty {
-            self.stream_short(entries);
+            self.stream_short(entries, batch);
             return;
         }
 
@@ -267,7 +338,7 @@ impl<'a> Renderer<'a> {
             let mut widths = Vec::with_capacity(chunk.len());
             let mut scratch = String::new();
             for entry in chunk {
-                widths.push(self.push_short_item(&mut text, entry, &mut scratch));
+                widths.push(self.push_short_item(&mut text, entry, &mut scratch, batch));
                 ends.push(text.len());
             }
             (text, ends, widths)
@@ -313,22 +384,22 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn print_long(&mut self, entries: &[&Entry<'_>]) {
+    fn print_long(&mut self, entries: &[&Entry<'_>], measured: &[&Entry<'_>], quote_pad: bool) {
         // Column widths depend on every entry. Large listings measure chunks
         // in parallel and merge them; nothing in this pass formats dates.
-        let widths = if entries.len() < PARALLEL_RENDER {
-            self.measure_long(entries)
+        let widths = if measured.len() < PARALLEL_RENDER {
+            self.measure_long(measured)
         } else {
-            entries
+            measured
                 .par_chunks(RENDER_CHUNK)
                 .map(|chunk| self.measure_long(chunk))
                 .reduce(LongWidths::default, LongWidths::max)
         };
 
-        let now = now_seconds();
+        let now = Timestamp::now();
         if entries.len() < PARALLEL_RENDER {
             let mut out = std::mem::take(self.out);
-            self.render_long(entries, &widths, now, None, &mut out);
+            self.render_long(entries, &widths, now, None, quote_pad, &mut out);
             *self.out = out;
             return;
         }
@@ -341,7 +412,7 @@ impl<'a> Renderer<'a> {
             .par_chunks(RENDER_CHUNK)
             .map(|chunk| {
                 let mut out = Vec::with_capacity(chunk.len() * 80);
-                self.render_long(chunk, &widths, now, Some(&days), &mut out);
+                self.render_long(chunk, &widths, now, Some(&days), quote_pad, &mut out);
                 out
             })
             .collect();
@@ -436,8 +507,9 @@ impl<'a> Renderer<'a> {
         &self,
         entries: &[&Entry<'_>],
         widths: &LongWidths,
-        now: i64,
+        now: Timestamp,
         days: Option<&DayOffsets>,
+        quote_pad: bool,
         out: &mut Vec<u8>,
     ) {
         let LongWidths {
@@ -518,18 +590,25 @@ impl<'a> Renderer<'a> {
             line.push(' ');
 
             let mtime = meta.mtime;
-            if last_time != Some(mtime) {
-                last_time = Some(mtime);
+            let when = Timestamp {
+                seconds: mtime,
+                nanoseconds: meta.mtime_nsec,
+            };
+            // Like GNU ls, re-read the clock before calling a time in the
+            // future, in case the file was modified after `now` was taken.
+            let recent = is_recent(when, now) || (when >= now && is_recent(when, Timestamp::now()));
+            if last_time != Some((mtime, recent)) {
+                last_time = Some((mtime, recent));
                 let datetime = match days {
                     Some(days) => days.local_time(mtime),
                     None => local_time(mtime),
                 };
-                push_format_time_at(mtime, now, datetime, &mut time_text);
+                push_format_time_at(datetime, recent, &mut time_text);
             }
             line.push_str(&time_text);
             line.push(' ');
 
-            self.push_name(&mut line, entry);
+            self.push_name(&mut line, entry, quote_pad);
             line.push_str(self.suffix(entry));
 
             if entry.file_type.is_symlink() {
@@ -577,4 +656,11 @@ impl LongWidths {
             size: self.size.max(other.size),
         }
     }
+}
+
+/// Per-batch layout facts shared by every short-format row.
+struct Batch {
+    inode_width: usize,
+    blocks_width: usize,
+    quote_pad: bool,
 }

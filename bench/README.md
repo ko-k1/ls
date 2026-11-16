@@ -34,9 +34,14 @@ cargo build --release
 bench/compare.sh /tmp/gnu-ls/gnu-ls                # exits 1 on any new difference
 ```
 
-Known incompatibilities are listed in `compare.sh` and reported as `known`
-without failing the run. Remove an entry once it is fixed, so a regression
-fails the check again.
+Known incompatibilities, if any, are listed in `compare.sh` and reported as
+`known` without failing the run (the list is currently empty). Terminal
+output (columns, quoting and its alignment, wide characters) is checked
+under a pseudo-terminal by a second script:
+
+```sh
+bench/compare-tty.sh /tmp/gnu-ls/gnu-ls
+```
 
 ## 4. Benchmark two builds
 

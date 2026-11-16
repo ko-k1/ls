@@ -7,9 +7,7 @@
 #
 # Color and terminal column output are excluded on purpose: GNU emits extra
 # reset sequences and tab-aligned columns, which differ byte-wise but not
-# visually. (Known terminal-only difference: when any name in a listing needs
-# shell quoting, GNU indents the unquoted names by one space; this ls does
-# not. Column widths otherwise match GNU, including double-width CJK.)
+# visually. Terminal output is checked separately by bench/compare-tty.sh.
 set -u
 
 ref=${1:?usage: compare.sh REFERENCE_LS [CANDIDATE_LS] [FIXTURES_DIR]}
@@ -18,6 +16,8 @@ cand=${2:-$here/../target/release/ls}
 fx=${3:-${TMPDIR:-/tmp}/ls-bench-fixtures}
 out=$(mktemp -d) || exit 2
 trap 'rm -rf -- "$out"' EXIT
+# A file modified just now must show its time of day, not its year.
+mkdir "$out/fresh" && touch "$out/fresh/new"
 
 cases=(
   "-1 {fx}/m100k" "-1 {fx}/l100k" "-1a {fx}/m10k" "-1A {fx}/m10k" "-la {fx}/m10k"
@@ -25,22 +25,20 @@ cases=(
   "-s {fx}/m10k" "-li {fx}/small" "-1F {fx}/m10k" "-1p {fx}/m10k" "-1U {fx}/small"
   "-1 --group-directories-first {fx}/m10k" "-R {fx}/tree" "-lR {fx}/tree"
   "-l /usr/lib" "-lh /usr/lib" "-l /usr/share/man/man3" "-1 /usr/include"
-  "-ld /usr /usr/lib /etc/passwd" "-l /usr/bin/sh /etc"
+  "-ld /usr /usr/lib /etc/passwd" "-l /usr/bin/sh /etc" "-1si {fx}/small"
+  "-1 /usr/share /etc/passwd /usr /etc/hosts" "-1t /usr/share /etc/passwd /usr"
+  "-lS /etc/passwd /etc/hosts /usr/bin/sh" "-1 --group-directories-first /usr/lib"
+  "-li /usr/include /etc/passwd" "-l {tmp}/fresh"
 )
 
 # Known, not yet fixed incompatibilities. They are reported but do not fail
 # the run; remove an entry once it is fixed so regressions are caught.
-declare -A known=(
-  ["-s {fx}/m10k"]="block column is not right-aligned outside -l"
-  ["-sh {fx}/m10k"]="block column is not right-aligned outside -l"
-  ["-1 --group-directories-first {fx}/m10k"]="symlinks to directories are not grouped with directories"
-  ["-ld /usr /usr/lib /etc/passwd"]="file operands are not sorted"
-  ["-l /usr/bin/sh /etc"]="GNU sizes file-operand columns including directory operands"
-)
+declare -A known=()
 
 failed=0
 for case in "${cases[@]}"; do
   args=${case//\{fx\}/$fx}
+  args=${args//\{tmp\}/$out}
   # Word splitting of $args is intended: each case is a list of arguments.
   # shellcheck disable=SC2086
   "$cand" $args >"$out/cand" 2>&1

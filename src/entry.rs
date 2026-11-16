@@ -152,7 +152,8 @@ pub struct Entry<'n> {
     pub link_target: Option<OsString>,
     pub file_type: EntryType,
     pub meta: Option<EntryMeta>,
-    /// Kind of the symlink target, when color output required resolving it.
+    /// Kind of the symlink target, when color or directory grouping
+    /// required resolving it.
     pub target_kind: Option<Kind>,
 }
 
@@ -255,7 +256,9 @@ pub fn build_entry<'n>(
     } else {
         None
     };
-    let target_kind = if color && file_type.is_symlink() {
+    // Color shows whether a symlink's target exists; --group-directories-first
+    // groups symlinks to directories with the directories.
+    let target_kind = if (color || opts.dirs_first) && file_type.is_symlink() {
         stat_at(dir_fd, name, AtFlags::empty())
             .ok()
             .map(|meta| kind_of(EntryType::from_mode(meta.mode), Some(meta.mode)))
