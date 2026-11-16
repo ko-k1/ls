@@ -599,3 +599,134 @@ fn name_order_matches_strcoll() {
         );
     }
 }
+
+/// Build a tree `fanout` wide and `depth` deep with `files` files per
+/// directory, and return the `ls -R -1` output a serial depth-first
+/// traversal must produce. Names are lowercase ASCII with fixed-width
+/// numbers, so byte order and collation order agree.
+fn build_tree(root: &Path, fanout: usize, depth: usize, files: usize) -> String {
+    fn visit(dir: &Path, shown: &str, fanout: usize, depth: usize, files: usize, out: &mut String) {
+        let mut names: Vec<String> = (0..files).map(|index| format!("f{index:02}")).collect();
+        let subdirs: Vec<String> = if depth == 0 {
+            Vec::new()
+        } else {
+            (0..fanout).map(|index| format!("d{index:02}")).collect()
+        };
+        for name in &names {
+            fs::write(dir.join(name), "").unwrap();
+        }
+        for name in &subdirs {
+            fs::create_dir(dir.join(name)).unwrap();
+        }
+        names.extend(subdirs.iter().cloned());
+        names.sort();
+
+        out.push_str(&format!("{shown}:\n"));
+        for name in &names {
+            out.push_str(name);
+            out.push('\n');
+        }
+        for name in &subdirs {
+            out.push('\n');
+            visit(
+                &dir.join(name),
+                &format!("{shown}/{name}"),
+                fanout,
+                depth - 1,
+                files,
+                out,
+            );
+        }
+    }
+
+    let mut expected = String::new();
+    visit(root, ".", fanout, depth, files, &mut expected);
+    expected
+}
+
+#[test]
+fn recursive_output_is_deterministic_depth_first() {
+    let dir = TestDir::new("walk-order");
+    let expected = build_tree(dir.path(), 4, 4, 6); // 341 directories
+
+    for _ in 0..5 {
+        let output = Command::new(env!("CARGO_BIN_EXE_ls"))
+            .args(["-R", "-1"])
+            .current_dir(dir.path())
+            .env("LC_ALL", "C")
+            .output()
+            .expect("failed to run ls");
+        assert!(output.status.success());
+        assert_eq!(stdout(&output), expected);
+    }
+}
+
+#[test]
+fn unreadable_subdirectory_is_reported_in_place() {
+    let dir = TestDir::new("walk-error");
+    build_tree(dir.path(), 3, 2, 2);
+    let locked = dir.path().join("d01");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&locked).is_ok() {
+        // Running with CAP_DAC_OVERRIDE (e.g. as root): nothing to test.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ls"))
+        .args(["-R", "-1"])
+        .current_dir(dir.path())
+        .env("LC_ALL", "C")
+        .output()
+        .expect("failed to run ls");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("cannot open directory './d01'").count(),
+        1,
+        "{stderr}"
+    );
+    let text = stdout(&output);
+    // The locked directory keeps its place: its header follows d00's
+    // subtree, and d02's subtree is still listed after it.
+    let d00 = text.find("./d00/d02:\n").expect("d00 subtree listed");
+    let d01 = text.find("./d01:\n").expect("d01 header printed");
+    let d02 = text.find("./d02/d00:\n").expect("d02 subtree listed");
+    assert!(d00 < d01 && d01 < d02);
+    assert!(!text.contains("./d01/"));
+}
+
+#[test]
+fn recursive_listing_stops_when_output_closes() {
+    let dir = TestDir::new("walk-epipe");
+    // 259 directories and ~6k long-format lines: ~300 KB, far more than a
+    // pipe buffer holds, so ls is still writing when the reader goes away.
+    build_tree(dir.path(), 6, 3, 20);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ls"))
+        .args(["-lR"])
+        .current_dir(dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to run ls");
+    let mut first = [0u8; 16];
+    std::io::Read::read_exact(child.stdout.as_mut().unwrap(), &mut first).unwrap();
+    drop(child.stdout.take());
+
+    // ls must notice the closed pipe and exit, not hang waiting on workers.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(2));
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ls did not exit after EPIPE"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}

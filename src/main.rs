@@ -17,6 +17,7 @@ mod render;
 mod sizes;
 mod sort;
 mod time;
+mod walk;
 
 use crate::args::parse_args;
 use crate::lister::Lister;
@@ -40,9 +41,9 @@ fn main() {
     let mut lister = Lister::new(opts);
     let mut code = lister.run(operands);
 
-    let output_error = match lister.output_error.take() {
+    let output_error = match lister.output.output_error.take() {
         Some(err) => Some(err),
-        None => lister.out.flush().err(),
+        None => lister.output.out.flush().err(),
     };
     if let Some(err) = output_error {
         eprintln!("ls: write error: {}", err);

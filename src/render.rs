@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use crate::args::{IndicatorStyle, Options};
@@ -16,46 +15,30 @@ use crate::quoting::quote_name;
 use crate::sizes::{format_blocks, push_format_blocks, push_human_size};
 use crate::time::{now_seconds, push_format_time, terminal_width};
 
-/// Renders already-loaded entries. Traversal and rendering are separate so
-/// directory loading does not need to know about column layout or colors.
+/// Renders already-loaded entries into an in-memory buffer. Traversal and
+/// rendering are separate so directory loading does not need to know about
+/// column layout or colors, and so directories can be rendered on worker
+/// threads while the main thread writes earlier output in order.
 pub struct Renderer<'a> {
     opts: &'a Options,
     color: bool,
     tty: bool,
-    out: &'a mut io::BufWriter<io::Stdout>,
-    output_error: &'a mut Option<io::Error>,
+    out: &'a mut Vec<u8>,
 }
 
 impl<'a> Renderer<'a> {
-    pub fn new(
-        opts: &'a Options,
-        color: bool,
-        tty: bool,
-        out: &'a mut io::BufWriter<io::Stdout>,
-        output_error: &'a mut Option<io::Error>,
-    ) -> Self {
+    pub fn new(opts: &'a Options, color: bool, tty: bool, out: &'a mut Vec<u8>) -> Self {
         Self {
             opts,
             color,
             tty,
             out,
-            output_error,
         }
     }
 
     fn write_line(&mut self, line: &str) {
-        if self.output_error.is_some() {
-            return;
-        }
-        if let Err(err) = self.out.write_all(line.as_bytes()) {
-            *self.output_error = Some(err);
-        } else if let Err(err) = self.out.write_all(b"\n") {
-            *self.output_error = Some(err);
-        }
-    }
-
-    fn failed(&self) -> bool {
-        self.output_error.is_some()
+        self.out.extend_from_slice(line.as_bytes());
+        self.out.push(b'\n');
     }
 
     pub fn print_entries(&mut self, entries: &[Entry], from_directory: bool) {
@@ -64,7 +47,7 @@ impl<'a> Renderer<'a> {
             self.write_line(&format!("total {}", format_blocks(total, self.opts.human)));
         }
 
-        if entries.is_empty() || self.failed() {
+        if entries.is_empty() {
             return;
         }
 
@@ -170,10 +153,6 @@ impl<'a> Renderer<'a> {
         let mut scratch = String::new();
 
         for entry in entries {
-            if self.failed() {
-                break;
-            }
-
             line.clear();
 
             if self.opts.inode {
@@ -190,10 +169,7 @@ impl<'a> Renderer<'a> {
             line.push_str(self.suffix(entry));
             line.push('\n');
 
-            if let Err(err) = self.out.write_all(line.as_bytes()) {
-                *self.output_error = Some(err);
-                break;
-            }
+            self.out.extend_from_slice(line.as_bytes());
         }
     }
 
@@ -204,10 +180,6 @@ impl<'a> Renderer<'a> {
         let mut scratch = String::new();
 
         for entry in entries {
-            if self.failed() {
-                break;
-            }
-
             line.clear();
 
             if self.opts.inode {
@@ -224,10 +196,7 @@ impl<'a> Renderer<'a> {
             line.extend_from_slice(self.suffix(entry).as_bytes());
             line.push(b'\n');
 
-            if let Err(err) = self.out.write_all(&line) {
-                *self.output_error = Some(err);
-                break;
-            }
+            self.out.extend_from_slice(&line);
         }
     }
 
@@ -273,10 +242,6 @@ impl<'a> Renderer<'a> {
         let mut line = String::with_capacity(width);
 
         for row in &layout.rows {
-            if self.failed() {
-                break;
-            }
-
             line.clear();
             for (position, &(index, column)) in row.iter().enumerate() {
                 let item = &items[index];
@@ -385,10 +350,6 @@ impl<'a> Renderer<'a> {
         let mut time_text = String::new();
 
         for entry in entries {
-            if self.failed() {
-                break;
-            }
-
             let meta = entry.metadata();
             line.clear();
 

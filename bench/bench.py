@@ -33,6 +33,7 @@ INSTRUCTION_CASES = [
     ("small(40) -la --color", "{fx}/small", ["-la", "--color=always"]),
     ("m1k -1", "{fx}/m1k", ["-1"]),
     ("m1k -l", "{fx}/m1k", ["-l"]),
+    ("small(40) -R", "{fx}/small", ["-R"]),
 ]
 
 TIMED_CASES = [
@@ -54,6 +55,8 @@ TIMED_CASES = [
     ("m100k -la --color", "{fx}/m100k", ["-la", "--color=always"], False),
     ("m100k -1 --color", "{fx}/m100k", ["-1", "--color=always"], False),
     ("m100k tty", "{fx}/m100k", [], True),
+    ("3 dirs -1", "{fx}", ["-1", "small", "m1k", "m10k"], False),
+    ("/usr/include -R", "/usr/include", ["-R"], False),
     ("tree -R", "{fx}/tree", ["-R"], False),
     ("tree -lR", "{fx}/tree", ["-lR"], False),
     ("cargo-src -lR", f"{HOME}/.cargo/registry/src", ["-lR"], False),
