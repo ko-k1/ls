@@ -58,7 +58,6 @@ mod tests {
     use crate::collate::{KeyMode, Level1Table};
     use crate::quoting::quote_name;
     use crate::sizes::{format_blocks, human_size};
-    use crate::sort::apply_order;
     use crate::time::{civil_from_days, format_time_at, utc_datetime, DateTime};
 
     #[test]
@@ -188,58 +187,6 @@ mod tests {
         assert_eq!(civil_from_days(59), (1970, 3, 1));
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
-    }
-
-    fn all_permutations(len: u32) -> Vec<Vec<u32>> {
-        if len == 0 {
-            return vec![Vec::new()];
-        }
-        let mut result = Vec::new();
-        for shorter in all_permutations(len - 1) {
-            for position in 0..=shorter.len() {
-                let mut permutation = shorter.clone();
-                permutation.insert(position, len - 1);
-                result.push(permutation);
-            }
-        }
-        result
-    }
-
-    #[test]
-    fn apply_order_handles_every_permutation() {
-        for len in 0..=6 {
-            for permutation in all_permutations(len) {
-                let original: Vec<String> = (0..len).map(|index| format!("item{index}")).collect();
-                let expected: Vec<String> = permutation
-                    .iter()
-                    .map(|&index| original[index as usize].clone())
-                    .collect();
-                let mut items = original.clone();
-                apply_order(&mut items, &permutation);
-                assert_eq!(items, expected, "order {permutation:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn apply_order_gathers_large_slices_in_parallel() {
-        // Large enough for the parallel path; a multiplicative step modulo a
-        // prime-length slice visits every index exactly once.
-        let len = 20_011u32;
-        let order: Vec<u32> = (0..len).map(|index| (index * 7919) % len).collect();
-        let mut items: Vec<String> = (0..len).map(|index| index.to_string()).collect();
-        apply_order(&mut items, &order);
-        assert!(items
-            .iter()
-            .zip(&order)
-            .all(|(item, &index)| *item == index.to_string()));
-    }
-
-    #[test]
-    #[should_panic(expected = "permutation")]
-    fn apply_order_rejects_repeated_indices() {
-        let mut items = vec![String::from("a"), String::from("b")];
-        apply_order(&mut items, &[0, 0]);
     }
 
     #[test]

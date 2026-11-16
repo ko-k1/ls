@@ -1,15 +1,14 @@
 use std::env;
-use std::ffi::OsString;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
 use crate::args::{ColorWhen, IgnoreMode, IndicatorStyle, Options};
-use crate::dir::DirReader;
+use crate::dir::{DirReader, RawEntry};
 use crate::entry::{build_entry, kind_of, may_stat, Entry, EntryMeta, EntryType};
 use crate::quoting::{quote_for_message, quote_name};
 use crate::render::Renderer;
@@ -165,7 +164,7 @@ impl Lister {
                             None
                         };
                         files.push(Entry {
-                            name: operand.as_os_str().to_owned(),
+                            name: operand.as_os_str(),
                             link_target,
                             file_type,
                             meta: Some(EntryMeta::from_metadata(&meta)),
@@ -188,7 +187,7 @@ impl Lister {
             let mut rendered = Vec::new();
             let settings = &self.settings;
             Renderer::new(&settings.opts, settings.color, settings.tty, &mut rendered)
-                .print_entries(&files, false);
+                .print_entries(&files.iter().collect::<Vec<_>>(), false);
             self.output.write(&rendered);
             self.output.first_block = false;
         }
@@ -228,7 +227,7 @@ pub fn list_dir(settings: &Settings, path: &Path, serious: bool) -> DirListing {
         subdirs: Vec::new(),
     };
 
-    let mut reader = match DirReader::open(path) {
+    let reader = match DirReader::open(path) {
         Ok(reader) => reader,
         Err(err) => {
             let path = quote_for_message(&path.to_string_lossy());
@@ -238,7 +237,7 @@ pub fn list_dir(settings: &Settings, path: &Path, serious: bool) -> DirListing {
     };
 
     let dir_fd = reader.fd();
-    let mut entries = Vec::new();
+    let mut dots = Vec::new();
 
     if opts.ignore == IgnoreMode::All {
         for dot in [".", ".."] {
@@ -252,8 +251,8 @@ pub fn list_dir(settings: &Settings, path: &Path, serious: bool) -> DirListing {
                 } else {
                     None
                 };
-                entries.push(Entry {
-                    name: OsString::from(dot),
+                dots.push(Entry {
+                    name: OsStr::new(dot),
                     link_target: None,
                     file_type,
                     meta: Some(EntryMeta::from_metadata(&meta)),
@@ -263,57 +262,42 @@ pub fn list_dir(settings: &Settings, path: &Path, serious: bool) -> DirListing {
         }
     }
 
+    // All names live in one buffer that the entries borrow from.
+    let mut names = Vec::new();
     let mut raw_entries = Vec::new();
-    while let Some(item) = reader.next_entry() {
-        let raw = match item {
-            Ok(raw) => raw,
-            Err(err) => {
-                let path = quote_for_message(&path.to_string_lossy());
-                listing.fail(serious, format!("ls: reading directory {path}: {err}"));
-                continue;
-            }
-        };
-
-        if opts.ignore == IgnoreMode::Default && raw.name.as_bytes().first() == Some(&b'.') {
-            continue;
-        }
-        raw_entries.push(raw);
+    let skip_hidden = opts.ignore == IgnoreMode::Default;
+    if let Err(err) = reader.read_all(skip_hidden, &mut names, &mut raw_entries) {
+        let path = quote_for_message(&path.to_string_lossy());
+        listing.fail(serious, format!("ls: reading directory {path}: {err}"));
     }
 
+    let build =
+        |raw: &RawEntry| build_entry(path, dir_fd, raw.name(&names), raw.file_type, opts, color);
     let loaded: Vec<Result<Entry, (PathBuf, io::Error)>> =
         if raw_entries.len() >= PARALLEL_STAT_THRESHOLD && may_stat(opts, color) {
-            raw_entries
-                .into_par_iter()
-                .map(|raw| build_entry(path, dir_fd, raw, opts, color))
-                .collect()
+            raw_entries.par_iter().map(build).collect()
         } else {
-            raw_entries
-                .into_iter()
-                .map(|raw| build_entry(path, dir_fd, raw, opts, color))
-                .collect()
+            raw_entries.iter().map(build).collect()
         };
 
-    for item in loaded {
-        match item {
-            Ok(entry) => entries.push(entry),
-            Err((entry_path, err)) => {
-                let path = quote_for_message(&entry_path.to_string_lossy());
-                listing.fail(false, format!("ls: cannot access {path}: {err}"));
-            }
-        }
+    for (entry_path, err) in loaded.iter().filter_map(|item| item.as_ref().err()) {
+        let path = quote_for_message(&entry_path.to_string_lossy());
+        listing.fail(false, format!("ls: cannot access {path}: {err}"));
     }
 
-    sort_entries(&mut entries, opts);
-    Renderer::new(opts, color, settings.tty, &mut listing.output).print_entries(&entries, true);
+    // Sort references straight into `loaded`; entries are never copied.
+    let mut sorted: Vec<&Entry> = dots
+        .iter()
+        .chain(loaded.iter().filter_map(|item| item.as_ref().ok()))
+        .collect();
+    sort_entries(&mut sorted, opts);
+    Renderer::new(opts, color, settings.tty, &mut listing.output).print_entries(&sorted, true);
 
     if opts.recursive {
-        listing.subdirs = entries
+        listing.subdirs = sorted
             .into_iter()
-            .filter(|entry| {
-                let name = entry.name.as_os_str();
-                entry.file_type.is_dir() && name != "." && name != ".."
-            })
-            .map(|entry| path.join(&entry.name))
+            .filter(|entry| entry.file_type.is_dir() && entry.name != "." && entry.name != "..")
+            .map(|entry| path.join(entry.name))
             .collect();
     }
     listing

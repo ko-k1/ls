@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::Metadata;
 use std::io;
 use std::os::unix::ffi::OsStringExt;
@@ -10,7 +10,6 @@ use rustix::fd::BorrowedFd;
 use rustix::fs::{AtFlags, Stat};
 
 use crate::args::{IndicatorStyle, Options, SortKey};
-use crate::dir::RawEntry;
 
 /// The semantic kind of a directory entry, as far as `ls` needs to know it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -143,8 +142,11 @@ impl EntryMeta {
 }
 
 /// A single directory entry with its name and (optionally loaded) metadata.
-pub struct Entry {
-    pub name: OsString,
+///
+/// The name is borrowed from the directory's shared names buffer (or from
+/// the command line), so entries cost no allocation of their own.
+pub struct Entry<'n> {
+    pub name: &'n OsStr,
     /// Contents of the symlink, read while loading entries when the long
     /// format will display it.
     pub link_target: Option<OsString>,
@@ -154,7 +156,7 @@ pub struct Entry {
     pub target_kind: Option<Kind>,
 }
 
-impl Entry {
+impl Entry<'_> {
     pub fn metadata(&self) -> &EntryMeta {
         self.meta
             .as_ref()
@@ -210,35 +212,34 @@ fn borrow_dir_fd<'fd>(dir_fd: RawFd) -> BorrowedFd<'fd> {
     unsafe { BorrowedFd::borrow_raw(dir_fd) }
 }
 
-fn stat_at(dir_fd: RawFd, name: &OsString, flags: AtFlags) -> io::Result<EntryMeta> {
+fn stat_at(dir_fd: RawFd, name: &OsStr, flags: AtFlags) -> io::Result<EntryMeta> {
     let stat = rustix::fs::statat(borrow_dir_fd(dir_fd), name, flags)?;
     Ok(EntryMeta::from_stat(&stat))
 }
 
 /// Read a symlink relative to its directory, avoiding a full path lookup.
 /// Unreadable links are shown without a target, as before.
-fn read_link_at(dir_fd: RawFd, name: &OsString) -> Option<OsString> {
+fn read_link_at(dir_fd: RawFd, name: &OsStr) -> Option<OsString> {
     rustix::fs::readlinkat(borrow_dir_fd(dir_fd), name, Vec::new())
         .ok()
         .map(|target| OsString::from_vec(target.into_bytes()))
 }
 
-/// Turn a raw directory entry into an `Entry`, loading metadata when requested.
-/// Returning the path with the error lets the caller report it from the main
-/// thread while metadata loading happens in parallel.
-pub fn build_entry(
+/// Turn a directory entry into an `Entry`, loading metadata when requested.
+/// Returning the path with the error lets the caller report it after
+/// metadata loading, which may run in parallel.
+pub fn build_entry<'n>(
     dir_path: &Path,
     dir_fd: RawFd,
-    raw: RawEntry,
+    name: &'n OsStr,
+    dirent_type: EntryType,
     opts: &Options,
     color: bool,
-) -> Result<Entry, (PathBuf, io::Error)> {
-    let RawEntry { name, file_type: dirent_type } = raw;
-
+) -> Result<Entry<'n>, (PathBuf, io::Error)> {
     let metadata = if needs_stat(opts, color, dirent_type) {
-        match stat_at(dir_fd, &name, AtFlags::SYMLINK_NOFOLLOW) {
+        match stat_at(dir_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(meta) => Some(meta),
-            Err(err) => return Err((dir_path.join(&name), err)),
+            Err(err) => return Err((dir_path.join(name), err)),
         }
     } else {
         None
@@ -250,12 +251,12 @@ pub fn build_entry(
     };
 
     let link_target = if opts.long && file_type.is_symlink() {
-        read_link_at(dir_fd, &name)
+        read_link_at(dir_fd, name)
     } else {
         None
     };
     let target_kind = if color && file_type.is_symlink() {
-        stat_at(dir_fd, &name, AtFlags::empty())
+        stat_at(dir_fd, name, AtFlags::empty())
             .ok()
             .map(|meta| kind_of(EntryType::from_mode(meta.mode), Some(meta.mode)))
     } else {
@@ -289,7 +290,7 @@ pub fn kind_of(file_type: EntryType, mode: Option<u32>) -> Kind {
     }
 }
 
-pub fn entry_kind(entry: &Entry) -> Kind {
+pub fn entry_kind(entry: &Entry<'_>) -> Kind {
     if entry.file_type.is_symlink() {
         if entry.target_kind.is_some() {
             Kind::Link

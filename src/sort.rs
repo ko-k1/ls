@@ -21,7 +21,9 @@ const KEYED_MIN: usize = 32;
 /// Marks a [`Keyed`] record whose name has no key.
 const NO_KEY: u32 = u32::MAX;
 
-pub fn sort_entries(entries: &mut Vec<Entry>, opts: &Options) {
+/// Sort references to a directory's entries. The entries themselves stay in
+/// readdir order and are never moved; sorting shuffles 8-byte references.
+pub fn sort_entries(entries: &mut Vec<&Entry<'_>>, opts: &Options) {
     match opts.sort {
         SortKey::None => {}
         SortKey::Name => sort_names(entries),
@@ -46,8 +48,8 @@ pub fn sort_entries(entries: &mut Vec<Entry>, opts: &Options) {
 
 /// Move directories to the front, keeping the existing order within both
 /// groups. This is a linear stable partition rather than a second sort.
-fn group_directories_first(entries: &mut Vec<Entry>) {
-    let others: Vec<Entry> = entries
+fn group_directories_first(entries: &mut Vec<&Entry<'_>>) {
+    let others: Vec<&Entry<'_>> = entries
         .extract_if(.., |entry| !entry.file_type.is_dir())
         .collect();
     entries.extend(others);
@@ -58,7 +60,7 @@ fn group_directories_first(entries: &mut Vec<Entry>) {
 /// Directory entry names are unique, so unstable sorts cannot change the
 /// result. They also run in linear time on input that is already sorted or
 /// reversed, which readdir often returns.
-fn sort_names(entries: &mut [Entry]) {
+fn sort_names(entries: &mut [&Entry<'_>]) {
     if entries.len() < 2 {
         return;
     }
@@ -74,7 +76,7 @@ fn sort_names(entries: &mut [Entry]) {
         Some(mode) if key_bytes < NO_KEY as usize && entries.len() < NO_KEY as usize => {
             sort_keyed(entries, mode);
         }
-        _ => sort_slice(entries, |a, b| collate::collate(&a.name, &b.name)),
+        _ => sort_slice(entries, |a, b| collate::collate(a.name, b.name)),
     }
 }
 
@@ -86,8 +88,8 @@ fn sort_slice<T: Send>(items: &mut [T], compare: impl Fn(&T, &T) -> Ordering + S
     }
 }
 
-/// An entry's position and sort key. Sorting these moves 24 bytes per entry
-/// instead of a whole [`Entry`].
+/// An entry's position and sort key, kept compact so comparisons read the
+/// key prefix without following a pointer.
 #[derive(Clone, Copy)]
 struct Keyed {
     /// The first eight key bytes, big-endian and zero-padded. Key bytes are
@@ -101,12 +103,12 @@ struct Keyed {
     index: u32,
 }
 
-fn sort_keyed(entries: &mut [Entry], mode: KeyMode) {
+fn sort_keyed(entries: &mut [&Entry<'_>], mode: KeyMode) {
     let (keys, mut records) = build_keys(entries, mode);
 
     let names = &*entries;
     let key = |record: &Keyed| &keys[record.start as usize..][..record.len as usize];
-    let name = |record: &Keyed| names[record.index as usize].name.as_os_str();
+    let name = |record: &Keyed| names[record.index as usize].name;
     let shortcut = |a: &Keyed, b: &Keyed| {
         if a.len != NO_KEY && b.len != NO_KEY {
             let ordering = a.prefix.cmp(&b.prefix).then_with(|| {
@@ -142,16 +144,19 @@ fn sort_keyed(entries: &mut [Entry], mode: KeyMode) {
         records.sort_unstable_by(compare);
     }
 
-    let order: Vec<u32> = records.iter().map(|record| record.index).collect();
-    apply_order(entries, &order);
+    let sorted: Vec<&Entry<'_>> = records
+        .iter()
+        .map(|record| entries[record.index as usize])
+        .collect();
+    entries.copy_from_slice(&sorted);
 }
 
 /// Build every entry's key into one shared buffer, plus a record per entry.
 /// Large directories build chunks in parallel and then concatenate them.
-fn build_keys(entries: &[Entry], mode: KeyMode) -> (Vec<u8>, Vec<Keyed>) {
+fn build_keys(entries: &[&Entry<'_>], mode: KeyMode) -> (Vec<u8>, Vec<Keyed>) {
     const CHUNK: usize = 4096;
 
-    let build = |first_index: usize, chunk: &[Entry]| {
+    let build = |first_index: usize, chunk: &[&Entry<'_>]| {
         let mut keys = Vec::with_capacity(chunk.iter().map(|entry| entry.name.len()).sum());
         let records: Vec<Keyed> = (first_index as u32..)
             .zip(chunk)
@@ -202,62 +207,10 @@ fn key_prefix(key: &[u8]) -> u64 {
     u64::from_be_bytes(bytes)
 }
 
-/// Rearrange `items` so that position `i` holds the item previously at
-/// `order[i]`.
-///
-/// Each item is moved exactly once into a scratch buffer, in output order,
-/// and the buffer is then copied back. Large slices gather in parallel.
-///
-/// # Panics
-///
-/// Panics if `order` is not a permutation of `0..items.len()`.
-pub fn apply_order<T: Send>(items: &mut [T], order: &[u32]) {
-    let len = items.len();
-    let mut seen = vec![false; len];
-    assert!(
-        order.len() == len
-            && order
-                .iter()
-                .all(|&index| !std::mem::replace(&mut seen[index as usize], true)),
-        "apply_order needs a permutation"
-    );
-
-    /// Raw pointer that may be shared across rayon workers. Accessed only
-    /// through `get` so closures capture the wrapper, not the pointer field.
-    struct Shared<T>(*mut T);
-    unsafe impl<T: Send> Sync for Shared<T> {}
-    impl<T> Shared<T> {
-        fn get(&self) -> *mut T {
-            self.0
-        }
-    }
-
-    let mut sorted: Vec<T> = Vec::with_capacity(len);
-    let source = Shared(items.as_mut_ptr());
-    let target = Shared(sorted.as_mut_ptr());
-    // SAFETY: `order` is a permutation (checked above), so every source slot
-    // is read exactly once and every target slot written exactly once. The
-    // gathered items are then copied over the originals, all of which were
-    // moved out. `sorted` keeps length 0, so nothing is dropped twice, and
-    // no code between the reads and the copy-back can panic.
-    let gather = |(position, &index): (usize, &u32)| unsafe {
-        target
-            .get()
-            .add(position)
-            .write(source.get().add(index as usize).read());
-    };
-    if len >= PARALLEL_SORT_THRESHOLD {
-        order.par_iter().enumerate().for_each(gather);
-    } else {
-        order.iter().enumerate().for_each(gather);
-    }
-    unsafe { std::ptr::copy_nonoverlapping(sorted.as_ptr(), items.as_mut_ptr(), len) };
-}
-
 /// Sort by a descending primary key, then by name within equal-key runs.
 fn sort_by_primary_then_names<K: Ord + Send>(
-    entries: &mut [Entry],
-    key: impl Fn(&Entry) -> K + Sync,
+    entries: &mut [&Entry<'_>],
+    key: impl Fn(&Entry<'_>) -> K + Sync,
 ) {
     // Equal primary keys are re-sorted by name below, so this sort does not
     // need to preserve readdir order.
@@ -269,9 +222,9 @@ fn sort_by_primary_then_names<K: Ord + Send>(
 
     let mut start = 0;
     while start < entries.len() {
-        let primary = key(&entries[start]);
+        let primary = key(entries[start]);
         let mut end = start + 1;
-        while end < entries.len() && key(&entries[end]) == primary {
+        while end < entries.len() && key(entries[end]) == primary {
             end += 1;
         }
         if end - start > 1 {

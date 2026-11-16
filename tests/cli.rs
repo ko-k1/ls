@@ -730,3 +730,41 @@ fn recursive_listing_stops_when_output_closes() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
+
+/// Large long listings render in parallel chunks; columns must still be
+/// sized over the whole listing, not per chunk.
+#[test]
+fn large_long_listing_aligns_columns_across_chunks() {
+    let dir = TestDir::new("long-chunks");
+    let mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    for index in 0..5000u64 {
+        let file = fs::File::create(dir.path().join(format!("f{index:05}"))).unwrap();
+        // One huge file at the end makes the size column widest there.
+        file.set_len(if index == 4999 {
+            10_000_000_000
+        } else {
+            index % 7
+        })
+        .unwrap();
+        file.set_modified(mtime).unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ls"))
+        .args(["-l"])
+        .current_dir(dir.path())
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+        .expect("failed to run ls");
+    assert!(output.status.success());
+    let text = stdout(&output);
+    let rows: Vec<&str> = text.lines().skip(1).collect();
+    assert_eq!(rows.len(), 5000);
+    assert!(
+        rows.iter().all(|row| row.len() == rows[0].len()),
+        "misaligned rows"
+    );
+    for (index, row) in rows.iter().enumerate() {
+        assert!(row.ends_with(&format!(" f{index:05}")), "{row}");
+    }
+}

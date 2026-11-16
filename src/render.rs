@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::os::unix::ffi::OsStrExt;
 
+use rayon::prelude::*;
+
 use crate::args::{IndicatorStyle, Options};
 use crate::color::{color_code, push_paint};
 use crate::entry::{entry_kind, Entry, Kind};
@@ -14,6 +16,10 @@ use crate::permissions::push_permissions;
 use crate::quoting::quote_name;
 use crate::sizes::{format_blocks, push_format_blocks, push_human_size};
 use crate::time::{now_seconds, push_format_time, terminal_width};
+
+/// Long listings with at least this many entries measure columns in parallel.
+const PARALLEL_MEASURE: usize = 4 * 1024;
+const MEASURE_CHUNK: usize = 2 * 1024;
 
 /// Renders already-loaded entries into an in-memory buffer. Traversal and
 /// rendering are separate so directory loading does not need to know about
@@ -41,7 +47,7 @@ impl<'a> Renderer<'a> {
         self.out.push(b'\n');
     }
 
-    pub fn print_entries(&mut self, entries: &[Entry], from_directory: bool) {
+    pub fn print_entries(&mut self, entries: &[&Entry<'_>], from_directory: bool) {
         if from_directory && (self.opts.long || self.opts.blocks) {
             let total: u64 = entries.iter().map(|entry| entry.metadata().blocks).sum();
             self.write_line(&format!("total {}", format_blocks(total, self.opts.human)));
@@ -58,7 +64,7 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn suffix(&self, entry: &Entry) -> &'static str {
+    fn suffix(&self, entry: &Entry<'_>) -> &'static str {
         // `file_type` comes from stat'd metadata when it was loaded, otherwise
         // from dirent.d_type (cheap but unreliable on some filesystems).
         let ft = entry.file_type;
@@ -93,7 +99,7 @@ impl<'a> Renderer<'a> {
     /// Return the shell-quoted display name for `entry`, handling both valid
     /// and invalid UTF-8 filenames. Invalid UTF-8 is rare and always takes the
     /// owned path to avoid borrowing from a temporary lossy string.
-    fn quoted_name(entry: &Entry, tty: bool) -> Cow<'_, str> {
+    fn quoted_name<'n>(entry: &Entry<'n>, tty: bool) -> Cow<'n, str> {
         match entry.name.to_str() {
             Some(name) => quote_name(name, tty),
             None => {
@@ -103,7 +109,7 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn push_name(&self, out: &mut String, entry: &Entry) {
+    fn push_name(&self, out: &mut String, entry: &Entry<'_>) {
         let kind = entry_kind(entry);
         let name = Self::quoted_name(entry, self.tty);
         if self.color {
@@ -113,7 +119,7 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn short_item(&self, entry: &Entry) -> DisplayItem {
+    fn short_item(&self, entry: &Entry<'_>) -> DisplayItem {
         let name = Self::quoted_name(entry, self.tty);
         let suffix = self.suffix(entry);
         let mut prefix = String::new();
@@ -140,7 +146,7 @@ impl<'a> Renderer<'a> {
         DisplayItem { text, width }
     }
 
-    fn stream_short(&mut self, entries: &[Entry]) {
+    fn stream_short(&mut self, entries: &[&Entry<'_>]) {
         if self.tty {
             self.stream_short_text(entries);
         } else {
@@ -148,7 +154,7 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn stream_short_text(&mut self, entries: &[Entry]) {
+    fn stream_short_text(&mut self, entries: &[&Entry<'_>]) {
         let mut line = String::with_capacity(512);
         let mut scratch = String::new();
 
@@ -175,7 +181,7 @@ impl<'a> Renderer<'a> {
 
     /// Piped output does not need UTF-8 conversion: write filename bytes
     /// through and only protect record boundaries.
-    fn stream_short_bytes(&mut self, entries: &[Entry]) {
+    fn stream_short_bytes(&mut self, entries: &[&Entry<'_>]) {
         let mut line = Vec::with_capacity(512);
         let mut scratch = String::new();
 
@@ -200,11 +206,8 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn push_name_bytes(&self, out: &mut Vec<u8>, entry: &Entry) {
-        let code = self
-            .color
-            .then(|| color_code(entry_kind(entry)))
-            .flatten();
+    fn push_name_bytes(&self, out: &mut Vec<u8>, entry: &Entry<'_>) {
+        let code = self.color.then(|| color_code(entry_kind(entry))).flatten();
         if let Some(code) = code {
             out.extend_from_slice(b"\x1b[");
             out.extend_from_slice(code.as_bytes());
@@ -230,7 +233,7 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn print_short(&mut self, entries: &[Entry]) {
+    fn print_short(&mut self, entries: &[&Entry<'_>]) {
         if self.opts.one_per_line || !self.tty {
             self.stream_short(entries);
             return;
@@ -259,14 +262,30 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn print_long(&mut self, entries: &[Entry]) {
-        let users = user_map();
-        let groups = group_map();
-        let now = now_seconds();
+    fn print_long(&mut self, entries: &[&Entry<'_>]) {
+        // Column widths depend on every entry. Large listings measure chunks
+        // in parallel and merge them; nothing in this pass formats dates.
+        let widths = if entries.len() < PARALLEL_MEASURE {
+            self.measure_long(entries)
+        } else {
+            entries
+                .par_chunks(MEASURE_CHUNK)
+                .map(|chunk| self.measure_long(chunk))
+                .reduce(LongWidths::default, LongWidths::max)
+        };
 
-        // Pass 1: measure the display width of each padded column. All field
-        // formatting is written into a single reused buffer so this pass does
-        // not allocate per entry.
+        // Rows are rendered on one thread: every distinct mtime goes through
+        // `localtime_r`, which takes a process-wide lock in glibc, so
+        // parallel rendering spent its time contending for that lock.
+        let mut out = std::mem::take(self.out);
+        self.render_long(entries, &widths, now_seconds(), &mut out);
+        *self.out = out;
+    }
+
+    /// Pass 1 of the long format: the display width of each padded column.
+    /// All field formatting reuses a few buffers, so this does not allocate
+    /// per entry.
+    fn measure_long(&self, entries: &[&Entry<'_>]) -> LongWidths {
         let mut width_inode = 0;
         let mut width_blocks = 0;
         let mut width_links = 0;
@@ -280,6 +299,8 @@ impl<'a> Renderer<'a> {
         let mut group_width = 0;
         let mut last_uid = None;
         let mut last_gid = None;
+        let users = user_map();
+        let groups = group_map();
 
         for entry in entries {
             let meta = entry.metadata();
@@ -330,22 +351,46 @@ impl<'a> Renderer<'a> {
             }
         }
 
-        // Pass 2: render each row directly into a reused output buffer,
-        // avoiding one allocated String per field plus a `Row` struct per
-        // entry. Permissions are always 10 characters; date and name are the
-        // final (unpadded) fields, matching the previous layout.
-        let line_capacity = width_inode
-            + width_blocks
-            + 10
-            + width_links
-            + width_owner
-            + width_group
-            + width_size
-            + 12
-            + 64;
-        let mut line = String::with_capacity(line_capacity);
-        last_uid = None;
-        last_gid = None;
+        LongWidths {
+            inode: width_inode,
+            blocks: width_blocks,
+            links: width_links,
+            owner: width_owner,
+            group: width_group,
+            size: width_size,
+        }
+    }
+
+    /// Pass 2 of the long format: render each row into a reused line buffer
+    /// and append it to `out`. Permissions are always 10 characters; date and
+    /// name are the final (unpadded) fields.
+    fn render_long(
+        &self,
+        entries: &[&Entry<'_>],
+        widths: &LongWidths,
+        now: i64,
+        out: &mut Vec<u8>,
+    ) {
+        let LongWidths {
+            inode: width_inode,
+            blocks: width_blocks,
+            links: width_links,
+            owner: width_owner,
+            group: width_group,
+            size: width_size,
+        } = *widths;
+        let users = user_map();
+        let groups = group_map();
+        let mut line = String::with_capacity(
+            width_inode + width_blocks + width_links + width_owner + width_group + width_size + 86,
+        );
+        let mut scratch = String::new();
+        let mut owner = String::new();
+        let mut group = String::new();
+        let mut owner_width = 0;
+        let mut group_width = 0;
+        let mut last_uid = None;
+        let mut last_gid = None;
         let mut last_time = None;
         let mut time_text = String::new();
 
@@ -431,7 +476,32 @@ impl<'a> Renderer<'a> {
                 }
             }
 
-            self.write_line(&line);
+            out.extend_from_slice(line.as_bytes());
+            out.push(b'\n');
+        }
+    }
+}
+
+/// Column widths of a long listing.
+#[derive(Clone, Copy, Default)]
+struct LongWidths {
+    inode: usize,
+    blocks: usize,
+    links: usize,
+    owner: usize,
+    group: usize,
+    size: usize,
+}
+
+impl LongWidths {
+    fn max(self, other: Self) -> Self {
+        Self {
+            inode: self.inode.max(other.inode),
+            blocks: self.blocks.max(other.blocks),
+            links: self.links.max(other.links),
+            owner: self.owner.max(other.owner),
+            group: self.group.max(other.group),
+            size: self.size.max(other.size),
         }
     }
 }
