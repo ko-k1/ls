@@ -1,27 +1,58 @@
-use std::ffi::OsString;
+use std::ffi::OsStr;
 use std::io;
-use std::os::unix::ffi::OsStringExt;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
-use rustix::fs::{Dir, Mode, OFlags};
+use rustix::fs::{Mode, OFlags};
 
 use crate::entry::EntryType;
 
 /// A directory entry as returned by the kernel, before metadata is loaded.
+/// The name lives in the names buffer passed to [`DirReader::read_all`];
+/// 8 bytes per entry keeps large directories compact.
 pub struct RawEntry {
-    pub name: OsString,
+    start: u32,
+    len: u16,
     pub file_type: EntryType,
 }
 
-/// Directory iterator backed by `getdents`, with one name allocation per entry.
+impl RawEntry {
+    pub fn name<'n>(&self, names: &'n [u8]) -> &'n OsStr {
+        let start = self.start as usize;
+        OsStr::from_bytes(&names[start..start + usize::from(self.len)])
+    }
+}
+
+/// Append `name` to `names` and record it, unless the buffer has outgrown
+/// 32-bit offsets.
+fn push(
+    names: &mut Vec<u8>,
+    entries: &mut Vec<RawEntry>,
+    name: &[u8],
+    file_type: EntryType,
+) -> io::Result<()> {
+    let start =
+        u32::try_from(names.len()).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    // Filename components are at most 255 bytes (NAME_MAX).
+    let len = u16::try_from(name.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    names.extend_from_slice(name);
+    entries.push(RawEntry {
+        start,
+        len,
+        file_type,
+    });
+    Ok(())
+}
+
+/// An open directory whose entries are read into one shared names buffer.
 ///
-/// `std::fs::ReadDir` keeps a second heap allocation (plus a shared reference
-/// count) alive in every `DirEntry`. On large directories that allocator traffic
-/// outweighs the actual directory read, so this reader copies each name once
-/// and otherwise reuses a single kernel buffer.
+/// Every name is copied exactly once, into a buffer that holds the whole
+/// directory's names, so reading allocates per directory rather than per
+/// entry. (`std::fs::ReadDir` allocates twice per entry, and rustix's `Dir`
+/// allocates a `CString` per entry after scanning each name twice.)
 pub struct DirReader {
-    dir: Dir,
+    fd: OwnedFd,
 }
 
 impl DirReader {
@@ -31,37 +62,74 @@ impl DirReader {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        Ok(Self { dir: Dir::new(fd)? })
+        Ok(Self { fd })
     }
 
     /// File descriptor for the open directory, usable for `statat` calls on
     /// entries while the reader is alive.
     pub fn fd(&self) -> RawFd {
-        self.dir
-            .fd()
-            .expect("directory descriptor is valid while the reader is open")
-            .as_raw_fd()
+        self.fd.as_raw_fd()
     }
 
-    /// Return the next entry, skipping the `.` and `..` entries that `readdir`
-    /// includes for every directory.
-    pub fn next_entry(&mut self) -> Option<io::Result<RawEntry>> {
-        loop {
-            let entry = match self.dir.read() {
-                Some(Ok(entry)) => entry,
-                Some(Err(err)) => return Some(Err(err.into())),
-                None => return None,
-            };
-
+    /// Read every entry except `.` and `..` (and, with `skip_hidden`, every
+    /// name starting with `.`), appending names to `names` and records to
+    /// `entries`. On a read error, the entries read so far are kept.
+    #[cfg(target_os = "linux")]
+    pub fn read_all(
+        &self,
+        skip_hidden: bool,
+        names: &mut Vec<u8>,
+        entries: &mut Vec<RawEntry>,
+    ) -> io::Result<()> {
+        // Large enough that a 100k-entry directory takes ~50 getdents calls.
+        const BUFFER: usize = 64 * 1024;
+        let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER);
+        let mut dir = rustix::fs::RawDir::new(&self.fd, buffer.spare_capacity_mut());
+        while let Some(entry) = dir.next() {
+            let entry = entry?;
             let name = entry.file_name().to_bytes();
-            if name == b"." || name == b".." {
+            if !keep(name, skip_hidden) {
                 continue;
             }
-
-            return Some(Ok(RawEntry {
-                name: OsString::from_vec(name.to_vec()),
-                file_type: EntryType::from_rustix(entry.file_type()),
-            }));
+            push(
+                names,
+                entries,
+                name,
+                EntryType::from_rustix(entry.file_type()),
+            )?;
         }
+        Ok(())
+    }
+
+    /// Portable fallback for [`read_all`](Self::read_all) on non-Linux Unix.
+    #[cfg(not(target_os = "linux"))]
+    pub fn read_all(
+        &self,
+        skip_hidden: bool,
+        names: &mut Vec<u8>,
+        entries: &mut Vec<RawEntry>,
+    ) -> io::Result<()> {
+        let mut dir = rustix::fs::Dir::read_from(&self.fd)?;
+        while let Some(entry) = dir.read() {
+            let entry = entry?;
+            let name = entry.file_name().to_bytes();
+            if !keep(name, skip_hidden) {
+                continue;
+            }
+            push(
+                names,
+                entries,
+                name,
+                EntryType::from_rustix(entry.file_type()),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn keep(name: &[u8], skip_hidden: bool) -> bool {
+    match name.first() {
+        Some(b'.') => !skip_hidden && name != b"." && name != b"..",
+        _ => true,
     }
 }

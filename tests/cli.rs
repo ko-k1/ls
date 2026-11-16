@@ -376,3 +376,475 @@ fn invalid_option_returns_status_2() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized option"));
 }
+
+#[test]
+fn long_format_reads_symlink_targets_inside_listed_directories() {
+    let dir = TestDir::new("symlink-dir");
+    fs::create_dir_all(dir.path().join("sub/deeper")).unwrap();
+    fs::write(dir.path().join("sub/target.txt"), "data").unwrap();
+    symlink("target.txt", dir.path().join("sub/link")).unwrap();
+    symlink("../target.txt", dir.path().join("sub/deeper/uplink")).unwrap();
+
+    // Targets are read relative to the listed directory, not the cwd.
+    let output = run(&dir, &["-l", "sub"]);
+    assert!(stdout(&output).contains(" link -> target.txt\n"));
+
+    // Recursion reaches nested directories through their parent's path.
+    let output = run(&dir, &["-lR", "sub"]);
+    let text = stdout(&output);
+    assert!(text.contains("sub/deeper:\n"));
+    assert!(text.contains(" uplink -> ../target.txt\n"));
+}
+
+#[test]
+fn color_marks_each_kind_without_long_format() {
+    let dir = TestDir::new("color-kinds");
+    fs::create_dir(dir.path().join("sub")).unwrap();
+    fs::write(dir.path().join("plain.txt"), "").unwrap();
+    fs::write(dir.path().join("run.sh"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(dir.path().join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    symlink("plain.txt", dir.path().join("link")).unwrap();
+    symlink("missing", dir.path().join("broken")).unwrap();
+
+    let output = run(&dir, &["--color=always", "-1"]);
+    let text = stdout(&output);
+
+    assert!(text.contains("\x1b[1;34msub\x1b[0m\n"));
+    assert!(text.contains("\x1b[1;32mrun.sh\x1b[0m\n"));
+    assert!(text.contains("\x1b[36mlink\x1b[0m\n"));
+    assert!(text.contains("\x1b[1;31mbroken\x1b[0m\n"));
+    assert!(text.lines().any(|line| line == "plain.txt"));
+}
+
+#[test]
+fn group_directories_first_keeps_order_within_groups() {
+    let dir = TestDir::new("dirs-first");
+    for name in ["a.txt", "c.txt", "e.txt"] {
+        fs::write(dir.path().join(name), "").unwrap();
+    }
+    for name in ["b", "d"] {
+        fs::create_dir(dir.path().join(name)).unwrap();
+    }
+
+    let output = run(&dir, &["-1", "--group-directories-first"]);
+    assert_eq!(stdout(&output), "b\nd\na.txt\nc.txt\ne.txt\n");
+
+    let output = run(&dir, &["-1r", "--group-directories-first"]);
+    assert_eq!(stdout(&output), "d\nb\ne.txt\nc.txt\na.txt\n");
+}
+
+/// Small directories are sorted with plain `strcoll` and large ones with
+/// byte-order shortcuts. Both must agree on every pair of names.
+#[test]
+fn small_and_large_directories_sort_consistently() {
+    let prefixes = [
+        "file", "File", "FILE", "_file", "file.", "file-", "a", "A", "b", "B", "z", "Z", "0", "9",
+        "$x", "café", "資料",
+    ];
+    let suffixes = [
+        "", "1", "10", "2", ".txt", ".TXT", "_x", "-y", " z", "a", "B",
+    ];
+    let mut names: std::collections::BTreeSet<String> = prefixes
+        .iter()
+        .flat_map(|prefix| {
+            suffixes
+                .iter()
+                .map(move |suffix| format!("{prefix}{suffix}"))
+        })
+        .collect();
+    names.extend((0..120).map(|index| format!("n{index}")));
+    let names: Vec<String> = names.into_iter().collect();
+    let subset: Vec<&String> = names.iter().step_by(10).collect();
+    assert!(names.len() >= 300 && subset.len() < 64);
+
+    let large = TestDir::new("collate-large");
+    let small = TestDir::new("collate-small");
+    for name in &names {
+        fs::write(large.path().join(name), "").unwrap();
+    }
+    for name in &subset {
+        fs::write(small.path().join(name), "").unwrap();
+    }
+
+    let list = |dir: &TestDir| {
+        let output = Command::new(env!("CARGO_BIN_EXE_ls"))
+            .arg("-1")
+            .current_dir(dir.path())
+            .env("LANG", "en_US.UTF-8")
+            .env_remove("LC_ALL")
+            .env_remove("LC_COLLATE")
+            .output()
+            .expect("failed to run ls");
+        assert!(output.status.success());
+        stdout(&output)
+    };
+
+    let large_order = list(&large);
+    let small_order = list(&small);
+    let expected: Vec<&str> = large_order
+        .lines()
+        .filter(|line| subset.iter().any(|name| name.as_str() == *line))
+        .collect();
+    assert_eq!(small_order.lines().collect::<Vec<_>>(), expected);
+}
+
+/// Names that stress collation: families that tie at level 1 and differ
+/// only in case or punctuation, `$` (weighted at level 1, unlike other
+/// punctuation), names made only of ignored characters, and non-ASCII.
+fn collation_corpus() -> Vec<String> {
+    const PIECES: &[&str] = &[
+        "a", "b", "m", "z", "A", "B", "M", "Z", "0", "1", "5", "9", "$", " ", "-", "_", ".", ",",
+        "+", "(", ")", "[", "]", "'", "!", "@", "#", "%", "&", "~", "=", "é", "ü", "資", "メ",
+    ];
+    let mut names = std::collections::BTreeSet::new();
+    for base in ["abc", "file1", "readme", "img2023", "x"] {
+        names.insert(base.to_string());
+        names.insert(base.to_uppercase());
+        names.insert(base[..1].to_uppercase() + &base[1..]);
+        for separator in ["_", "-", ".", " ", "$"] {
+            for position in 0..=base.len() {
+                names.insert(format!(
+                    "{}{separator}{}",
+                    &base[..position],
+                    &base[position..]
+                ));
+            }
+        }
+    }
+
+    // Deterministic xorshift so failures reproduce.
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    while names.len() < 3000 {
+        let len = 1 + next() % 10;
+        let name: String = (0..len)
+            .map(|_| PIECES[(next() % PIECES.len() as u64) as usize])
+            .collect();
+        if name != "." && name != ".." {
+            names.insert(name);
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// The listing must be in `strcoll` order, checked with this process's own
+/// libc. Debug builds of ls additionally assert every comparison that its
+/// sort keys decide against `strcoll`.
+#[test]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn name_order_matches_strcoll() {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int};
+
+    extern "C" {
+        fn setlocale(category: c_int, locale: *const c_char) -> *mut c_char;
+        fn strcoll(a: *const c_char, b: *const c_char) -> c_int;
+    }
+    const LC_COLLATE: c_int = 3;
+
+    let locale = CString::new("en_US.UTF-8").unwrap();
+    // Only this test uses locale-dependent libc functions in this process.
+    if unsafe { setlocale(LC_COLLATE, locale.as_ptr()) }.is_null() {
+        eprintln!("en_US.UTF-8 is not installed; skipping");
+        return;
+    }
+    let collate = |a: &str, b: &str| {
+        let (a, b) = (CString::new(a).unwrap(), CString::new(b).unwrap());
+        unsafe { strcoll(a.as_ptr(), b.as_ptr()) }
+    };
+
+    let names = collation_corpus();
+    let dir = TestDir::new("strcoll-order");
+    for name in &names {
+        fs::write(dir.path().join(name), "").unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ls"))
+        .arg("-1A")
+        .current_dir(dir.path())
+        .env("LANG", "en_US.UTF-8")
+        .env_remove("LC_ALL")
+        .env_remove("LC_COLLATE")
+        .output()
+        .expect("failed to run ls");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let listed: Vec<&str> = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .collect();
+    let mut expected_set: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut listed_set = listed.clone();
+    expected_set.sort_unstable();
+    listed_set.sort_unstable();
+    assert_eq!(
+        listed_set, expected_set,
+        "listing is not a permutation of the created names"
+    );
+    for pair in listed.windows(2) {
+        assert!(
+            collate(pair[0], pair[1]) <= 0,
+            "{:?} listed before {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+/// Build a tree `fanout` wide and `depth` deep with `files` files per
+/// directory, and return the `ls -R -1` output a serial depth-first
+/// traversal must produce. Names are lowercase ASCII with fixed-width
+/// numbers, so byte order and collation order agree.
+fn build_tree(root: &Path, fanout: usize, depth: usize, files: usize) -> String {
+    fn visit(dir: &Path, shown: &str, fanout: usize, depth: usize, files: usize, out: &mut String) {
+        let mut names: Vec<String> = (0..files).map(|index| format!("f{index:02}")).collect();
+        let subdirs: Vec<String> = if depth == 0 {
+            Vec::new()
+        } else {
+            (0..fanout).map(|index| format!("d{index:02}")).collect()
+        };
+        for name in &names {
+            fs::write(dir.join(name), "").unwrap();
+        }
+        for name in &subdirs {
+            fs::create_dir(dir.join(name)).unwrap();
+        }
+        names.extend(subdirs.iter().cloned());
+        names.sort();
+
+        out.push_str(&format!("{shown}:\n"));
+        for name in &names {
+            out.push_str(name);
+            out.push('\n');
+        }
+        for name in &subdirs {
+            out.push('\n');
+            visit(
+                &dir.join(name),
+                &format!("{shown}/{name}"),
+                fanout,
+                depth - 1,
+                files,
+                out,
+            );
+        }
+    }
+
+    let mut expected = String::new();
+    visit(root, ".", fanout, depth, files, &mut expected);
+    expected
+}
+
+#[test]
+fn recursive_output_is_deterministic_depth_first() {
+    let dir = TestDir::new("walk-order");
+    let expected = build_tree(dir.path(), 4, 4, 6); // 341 directories
+
+    for _ in 0..5 {
+        let output = Command::new(env!("CARGO_BIN_EXE_ls"))
+            .args(["-R", "-1"])
+            .current_dir(dir.path())
+            .env("LC_ALL", "C")
+            .output()
+            .expect("failed to run ls");
+        assert!(output.status.success());
+        assert_eq!(stdout(&output), expected);
+    }
+}
+
+#[test]
+fn unreadable_subdirectory_is_reported_in_place() {
+    let dir = TestDir::new("walk-error");
+    build_tree(dir.path(), 3, 2, 2);
+    let locked = dir.path().join("d01");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&locked).is_ok() {
+        // Running with CAP_DAC_OVERRIDE (e.g. as root): nothing to test.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ls"))
+        .args(["-R", "-1"])
+        .current_dir(dir.path())
+        .env("LC_ALL", "C")
+        .output()
+        .expect("failed to run ls");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("cannot open directory './d01'").count(),
+        1,
+        "{stderr}"
+    );
+    let text = stdout(&output);
+    // The locked directory keeps its place: its header follows d00's
+    // subtree, and d02's subtree is still listed after it.
+    let d00 = text.find("./d00/d02:\n").expect("d00 subtree listed");
+    let d01 = text.find("./d01:\n").expect("d01 header printed");
+    let d02 = text.find("./d02/d00:\n").expect("d02 subtree listed");
+    assert!(d00 < d01 && d01 < d02);
+    assert!(!text.contains("./d01/"));
+}
+
+#[test]
+fn recursive_listing_stops_when_output_closes() {
+    let dir = TestDir::new("walk-epipe");
+    // 259 directories and ~6k long-format lines: ~300 KB, far more than a
+    // pipe buffer holds, so ls is still writing when the reader goes away.
+    build_tree(dir.path(), 6, 3, 20);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ls"))
+        .args(["-lR"])
+        .current_dir(dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to run ls");
+    let mut first = [0u8; 16];
+    std::io::Read::read_exact(child.stdout.as_mut().unwrap(), &mut first).unwrap();
+    drop(child.stdout.take());
+
+    // ls must notice the closed pipe and exit, not hang waiting on workers.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(2));
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ls did not exit after EPIPE"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Large long listings render in parallel chunks; columns must still be
+/// sized over the whole listing, not per chunk.
+#[test]
+fn large_long_listing_aligns_columns_across_chunks() {
+    let dir = TestDir::new("long-chunks");
+    let mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    for index in 0..5000u64 {
+        let file = fs::File::create(dir.path().join(format!("f{index:05}"))).unwrap();
+        // One huge file at the end makes the size column widest there.
+        file.set_len(if index == 4999 {
+            10_000_000_000
+        } else {
+            index % 7
+        })
+        .unwrap();
+        file.set_modified(mtime).unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ls"))
+        .args(["-l"])
+        .current_dir(dir.path())
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+        .expect("failed to run ls");
+    assert!(output.status.success());
+    let text = stdout(&output);
+    let rows: Vec<&str> = text.lines().skip(1).collect();
+    assert_eq!(rows.len(), 5000);
+    assert!(
+        rows.iter().all(|row| row.len() == rows[0].len()),
+        "misaligned rows"
+    );
+    for (index, row) in rows.iter().enumerate() {
+        assert!(row.ends_with(&format!(" f{index:05}")), "{row}");
+    }
+}
+
+#[test]
+fn operands_are_sorted_like_gnu() {
+    let dir = TestDir::new("operand-order");
+    for name in ["c.txt", "a.txt", "b.txt"] {
+        fs::write(dir.path().join(name), name.repeat(10)).unwrap();
+    }
+    fs::write(dir.path().join("big"), vec![b'x'; 4000]).unwrap();
+    for name in ["zdir", "adir"] {
+        fs::create_dir(dir.path().join(name)).unwrap();
+        fs::write(dir.path().join(name).join("inner"), "").unwrap();
+    }
+
+    let output = run(&dir, &["-1", "c.txt", "zdir", "a.txt", "adir", "b.txt"]);
+    assert_eq!(
+        stdout(&output),
+        "a.txt\nb.txt\nc.txt\n\nadir:\ninner\n\nzdir:\ninner\n"
+    );
+
+    let output = run(&dir, &["-1S", "a.txt", "big", "b.txt"]);
+    assert_eq!(stdout(&output), "big\na.txt\nb.txt\n");
+}
+
+#[test]
+fn block_column_is_aligned_outside_long_format() {
+    let dir = TestDir::new("blocks-aligned");
+    fs::write(dir.path().join("empty"), "").unwrap();
+    fs::write(dir.path().join("large"), vec![b'x'; 200_000]).unwrap();
+
+    let output = run(&dir, &["-1s"]);
+    let text = stdout(&output);
+    let rows: Vec<&str> = text.lines().skip(1).collect();
+    let starts: Vec<usize> = rows
+        .iter()
+        .map(|row| row.len() - row.trim_start().split_once(' ').unwrap().1.len())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(starts[0], starts[1], "names not aligned: {rows:?}");
+    assert!(
+        rows[0].starts_with(' '),
+        "small count not right-aligned: {rows:?}"
+    );
+}
+
+#[test]
+fn group_directories_first_includes_symlinks_to_directories() {
+    let dir = TestDir::new("dirs-first-links");
+    fs::create_dir(dir.path().join("real")).unwrap();
+    fs::write(dir.path().join("file"), "").unwrap();
+    symlink("real", dir.path().join("alias")).unwrap();
+    symlink("missing", dir.path().join("broken")).unwrap();
+
+    for args in [
+        ["-1", "--group-directories-first"],
+        ["-l", "--group-directories-first"],
+    ] {
+        let output = run(&dir, &args);
+        let names: Vec<String> = stdout(&output)
+            .lines()
+            .filter(|line| !line.starts_with("total"))
+            .map(|line| {
+                let line = line.split(" -> ").next().unwrap();
+                line.rsplit(' ').next().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(names, ["alias", "real", "broken", "file"], "{args:?}");
+    }
+}
+
+#[test]
+fn file_modified_just_now_shows_time_of_day() {
+    let dir = TestDir::new("fresh");
+    fs::write(dir.path().join("new"), "").unwrap();
+
+    let output = run(&dir, &["-l", "new"]);
+    let text = stdout(&output);
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    let time = fields[fields.len() - 2];
+    assert!(time.contains(':'), "expected a time of day, got {text:?}");
+}
