@@ -80,6 +80,55 @@ pub fn quote_name<'a>(name: &'a str, tty: bool) -> Cow<'a, str> {
     }
 }
 
+/// Return `true` if `name` is ASCII and displays as-is on a terminal, so
+/// `quote_name` would return it unchanged. Uses a table derived from
+/// [`needs_shell_quoting`], avoiding UTF-8 decoding for the common case.
+pub fn is_plain_ascii(name: &[u8]) -> bool {
+    static PLAIN: [bool; 128] = {
+        let mut table = [true; 128];
+        let mut byte = 0;
+        while byte < 128 {
+            table[byte] = !ascii_needs_quoting(byte as u8);
+            byte += 1;
+        }
+        table
+    };
+    !name.is_empty()
+        && name
+            .iter()
+            .all(|&byte| PLAIN.get(usize::from(byte)) == Some(&true))
+}
+
+/// [`needs_shell_quoting`] for a single ASCII character.
+const fn ascii_needs_quoting(byte: u8) -> bool {
+    byte < 0x20
+        || byte == 0x7f
+        || matches!(
+            byte,
+            b' ' | b'\''
+                | b'"'
+                | b'\\'
+                | b'$'
+                | b'`'
+                | b'&'
+                | b';'
+                | b'|'
+                | b'<'
+                | b'>'
+                | b'('
+                | b')'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'*'
+                | b'?'
+                | b'#'
+                | b'~'
+                | b'!'
+        )
+}
+
 /// Return `true` if `name` requires shell quoting.
 fn needs_shell_quoting(name: &str) -> bool {
     name.chars().any(|ch| {
@@ -118,5 +167,24 @@ pub fn quote_for_message(name: &str) -> String {
         quoted.into_owned()
     } else {
         format!("'{}'", quoted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_table_matches_shell_quoting_rules() {
+        for byte in 0u8..128 {
+            let name = (byte as char).to_string();
+            assert_eq!(
+                is_plain_ascii(name.as_bytes()),
+                !needs_shell_quoting(&name),
+                "byte {byte:#04x}"
+            );
+        }
+        assert!(!is_plain_ascii("café".as_bytes()));
+        assert!(!is_plain_ascii(b""));
     }
 }

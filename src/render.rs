@@ -11,15 +11,15 @@ use crate::format::{
     push_u64_bytes,
 };
 use crate::ids::{group_map, user_map};
-use crate::layout::{layout_columns, DisplayItem};
+use crate::layout::{display_width, layout_columns};
 use crate::permissions::push_permissions;
-use crate::quoting::quote_name;
+use crate::quoting::{is_plain_ascii, quote_name};
 use crate::sizes::{format_blocks, push_format_blocks, push_human_size};
-use crate::time::{now_seconds, push_format_time, terminal_width};
+use crate::time::{local_time, now_seconds, push_format_time_at, terminal_width, DayOffsets};
 
-/// Long listings with at least this many entries measure columns in parallel.
-const PARALLEL_MEASURE: usize = 4 * 1024;
-const MEASURE_CHUNK: usize = 2 * 1024;
+/// Listings with at least this many entries are rendered in parallel chunks.
+const PARALLEL_RENDER: usize = 4 * 1024;
+const RENDER_CHUNK: usize = 2 * 1024;
 
 /// Renders already-loaded entries into an in-memory buffer. Traversal and
 /// rendering are separate so directory loading does not need to know about
@@ -119,31 +119,50 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn short_item(&self, entry: &Entry<'_>) -> DisplayItem {
-        let name = Self::quoted_name(entry, self.tty);
-        let suffix = self.suffix(entry);
-        let mut prefix = String::new();
-
+    /// Append one entry as it appears in column output (inode and block
+    /// prefixes, colored and quoted name, indicator) to `text`, returning
+    /// its display width.
+    fn push_short_item(
+        &self,
+        text: &mut Vec<u8>,
+        entry: &Entry<'_>,
+        scratch: &mut String,
+    ) -> usize {
+        let start = text.len();
         if self.opts.inode {
-            push_u64(&mut prefix, entry.metadata().ino);
-            prefix.push(' ');
+            push_u64_bytes(text, entry.metadata().ino);
+            text.push(b' ');
         }
         if self.opts.blocks {
-            prefix.push_str(&format_blocks(entry.metadata().blocks, self.opts.human));
-            prefix.push(' ');
+            push_format_blocks(entry.metadata().blocks, self.opts.human, scratch);
+            text.extend_from_slice(scratch.as_bytes());
+            text.push(b' ');
         }
+        // Prefixes and indicators are ASCII: one column per byte.
+        let mut width = text.len() - start;
 
-        let width = prefix.chars().count() + name.chars().count() + suffix.chars().count();
-        let mut text = String::with_capacity(width + 16);
-        text.push_str(&prefix);
-        if self.color {
-            push_paint(&mut text, entry_kind(entry), &name);
+        let code = self.color.then(|| color_code(entry_kind(entry))).flatten();
+        if let Some(code) = code {
+            text.extend_from_slice(b"\x1b[");
+            text.extend_from_slice(code.as_bytes());
+            text.push(b'm');
+        }
+        let name = entry.name.as_bytes();
+        if is_plain_ascii(name) {
+            text.extend_from_slice(name);
+            width += name.len();
         } else {
-            text.push_str(&name);
+            let quoted = Self::quoted_name(entry, self.tty);
+            text.extend_from_slice(quoted.as_bytes());
+            width += display_width(&quoted);
         }
-        text.push_str(suffix);
+        if code.is_some() {
+            text.extend_from_slice(b"\x1b[0m");
+        }
 
-        DisplayItem { text, width }
+        let suffix = self.suffix(entry);
+        text.extend_from_slice(suffix.as_bytes());
+        width + suffix.len()
     }
 
     fn stream_short(&mut self, entries: &[&Entry<'_>]) {
@@ -239,47 +258,96 @@ impl<'a> Renderer<'a> {
             return;
         }
 
-        let items: Vec<DisplayItem> = entries.iter().map(|entry| self.short_item(entry)).collect();
-        let width = terminal_width();
-        let layout = layout_columns(&items, width);
-        let mut line = String::with_capacity(width);
+        // Render every item once into a shared buffer, remembering where
+        // each one ends and how wide it displays. Large listings render
+        // chunks in parallel and concatenate them.
+        let render = |chunk: &[&Entry<'_>]| {
+            let mut text = Vec::with_capacity(chunk.len() * 24);
+            let mut ends = Vec::with_capacity(chunk.len());
+            let mut widths = Vec::with_capacity(chunk.len());
+            let mut scratch = String::new();
+            for entry in chunk {
+                widths.push(self.push_short_item(&mut text, entry, &mut scratch));
+                ends.push(text.len());
+            }
+            (text, ends, widths)
+        };
+        let (text, ends, widths) = if entries.len() < PARALLEL_RENDER {
+            render(entries)
+        } else {
+            let parts: Vec<_> = entries.par_chunks(RENDER_CHUNK).map(render).collect();
+            let mut text = Vec::with_capacity(parts.iter().map(|part| part.0.len()).sum());
+            let mut ends = Vec::with_capacity(entries.len());
+            let mut widths = Vec::with_capacity(entries.len());
+            for (part_text, part_ends, part_widths) in parts {
+                let base = text.len();
+                text.extend_from_slice(&part_text);
+                ends.extend(part_ends.iter().map(|end| base + end));
+                widths.extend(part_widths);
+            }
+            (text, ends, widths)
+        };
 
-        for row in &layout.rows {
-            line.clear();
-            for (position, &(index, column)) in row.iter().enumerate() {
-                let item = &items[index];
-                line.push_str(&item.text);
+        const SPACES: [u8; 256] = [b' '; 256];
+        let layout = layout_columns(&widths, terminal_width());
+        let count = entries.len();
+        for row in 0..layout.rows {
+            for column in 0..layout.columns {
+                let index = column * layout.rows + row;
+                if index >= count {
+                    break;
+                }
+                let start = if index == 0 { 0 } else { ends[index - 1] };
+                self.out.extend_from_slice(&text[start..ends[index]]);
 
-                if position + 1 < row.len() {
-                    let padding = layout.widths[column].saturating_sub(item.width) + 2;
-                    for _ in 0..padding {
-                        line.push(' ');
+                if index + layout.rows < count {
+                    let mut padding = layout.widths[column] - widths[index] + 2;
+                    while padding > 0 {
+                        let chunk = padding.min(SPACES.len());
+                        self.out.extend_from_slice(&SPACES[..chunk]);
+                        padding -= chunk;
                     }
                 }
             }
-
-            self.write_line(&line);
+            self.out.push(b'\n');
         }
     }
 
     fn print_long(&mut self, entries: &[&Entry<'_>]) {
         // Column widths depend on every entry. Large listings measure chunks
         // in parallel and merge them; nothing in this pass formats dates.
-        let widths = if entries.len() < PARALLEL_MEASURE {
+        let widths = if entries.len() < PARALLEL_RENDER {
             self.measure_long(entries)
         } else {
             entries
-                .par_chunks(MEASURE_CHUNK)
+                .par_chunks(RENDER_CHUNK)
                 .map(|chunk| self.measure_long(chunk))
                 .reduce(LongWidths::default, LongWidths::max)
         };
 
-        // Rows are rendered on one thread: every distinct mtime goes through
-        // `localtime_r`, which takes a process-wide lock in glibc, so
-        // parallel rendering spent its time contending for that lock.
-        let mut out = std::mem::take(self.out);
-        self.render_long(entries, &widths, now_seconds(), &mut out);
-        *self.out = out;
+        let now = now_seconds();
+        if entries.len() < PARALLEL_RENDER {
+            let mut out = std::mem::take(self.out);
+            self.render_long(entries, &widths, now, None, &mut out);
+            *self.out = out;
+            return;
+        }
+
+        // Every row depends only on its entry, the widths and a shared,
+        // read-only table of day offsets (built here, on one thread), so
+        // render chunks in parallel and append them in order.
+        let days = DayOffsets::for_times(entries.iter().map(|entry| entry.metadata().mtime));
+        let parts: Vec<Vec<u8>> = entries
+            .par_chunks(RENDER_CHUNK)
+            .map(|chunk| {
+                let mut out = Vec::with_capacity(chunk.len() * 80);
+                self.render_long(chunk, &widths, now, Some(&days), &mut out);
+                out
+            })
+            .collect();
+        for part in parts {
+            self.out.extend_from_slice(&part);
+        }
     }
 
     /// Pass 1 of the long format: the display width of each padded column.
@@ -369,6 +437,7 @@ impl<'a> Renderer<'a> {
         entries: &[&Entry<'_>],
         widths: &LongWidths,
         now: i64,
+        days: Option<&DayOffsets>,
         out: &mut Vec<u8>,
     ) {
         let LongWidths {
@@ -451,7 +520,11 @@ impl<'a> Renderer<'a> {
             let mtime = meta.mtime;
             if last_time != Some(mtime) {
                 last_time = Some(mtime);
-                push_format_time(mtime, now, &mut time_text);
+                let datetime = match days {
+                    Some(days) => days.local_time(mtime),
+                    None => local_time(mtime),
+                };
+                push_format_time_at(mtime, now, datetime, &mut time_text);
             }
             line.push_str(&time_text);
             line.push(' ');

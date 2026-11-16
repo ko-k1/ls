@@ -7,7 +7,9 @@
 #
 # Color and terminal column output are excluded on purpose: GNU emits extra
 # reset sequences and tab-aligned columns, which differ byte-wise but not
-# visually.
+# visually. (Known terminal-only difference: when any name in a listing needs
+# shell quoting, GNU indents the unquoted names by one space; this ls does
+# not. Column widths otherwise match GNU, including double-width CJK.)
 set -u
 
 ref=${1:?usage: compare.sh REFERENCE_LS [CANDIDATE_LS] [FIXTURES_DIR]}
