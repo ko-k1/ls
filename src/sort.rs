@@ -1,238 +1,25 @@
 use std::cmp::{Ordering, Reverse};
-use std::env;
-use std::ffi::{CString, OsStr};
-use std::mem::MaybeUninit;
-use std::os::raw::{c_char, c_int};
 use std::os::unix::ffi::OsStrExt;
-use std::ptr;
-use std::sync::OnceLock;
 
 use rayon::prelude::*;
 
 use crate::args::{Options, SortKey};
+use crate::collate::{self, KeyMode};
 use crate::entry::Entry;
-
-extern "C" {
-    fn strcoll(a: *const c_char, b: *const c_char) -> c_int;
-}
-
-/// Largest filename component on Unix. Keeping the C string on the stack
-/// avoids two heap allocations per comparison for the common case.
-const STACK_NAME: usize = 256;
 
 const PARALLEL_SORT_THRESHOLD: usize = 8 * 1024;
 
-/// Smallest sort that probes the locale for the ASCII fast path.
+/// Smallest name sort that verifies the locale's level-1 table to use keys.
 ///
-/// The probe costs about 415 `strcoll` calls (~330k instructions), once per
-/// process. Measured under en_US.UTF-8, plain `strcoll` is cheaper up to
-/// roughly 100 real-world names and 140 synthetic mixed-case names, so small
-/// sorts skip the probe unless an earlier, larger sort already paid for it.
-const FAST_PATH_MIN: usize = 128;
+/// Verification costs about 190 `strcoll` calls (~60k instructions), once
+/// per process. Measured under en_US.UTF-8, plain `strcoll` sorting is
+/// cheaper below roughly 30 real-world names (40 synthetic mixed-case
+/// names). Once any sort has paid for verification, sorts of every size use
+/// keys.
+const KEYED_MIN: usize = 32;
 
-/// How names are compared for one sort.
-#[derive(Clone, Copy)]
-enum Collation {
-    /// The C/POSIX locales: plain byte order.
-    Bytewise,
-    /// Byte-order shortcuts verified for the current locale, with `strcoll`
-    /// for everything else.
-    Fast(&'static AsciiOrder),
-    /// `strcoll` for every comparison.
-    Libc,
-}
-
-impl Collation {
-    fn for_len(len: usize) -> Self {
-        if locale_is_bytewise() {
-            Self::Bytewise
-        } else if let Some(order) = ASCII_ORDER.get() {
-            Self::Fast(order)
-        } else if len >= FAST_PATH_MIN {
-            Self::Fast(ascii_order())
-        } else {
-            Self::Libc
-        }
-    }
-
-    fn compare(self, a: &OsStr, b: &OsStr) -> Ordering {
-        match self {
-            Self::Bytewise => a.as_bytes().cmp(b.as_bytes()),
-            Self::Fast(order) => collate_fast(order, a, b),
-            Self::Libc => collate_slow(a, b),
-        }
-    }
-}
-
-/// Locale-aware comparison of two entry names, using shortcuts that were
-/// verified for the current locale by [`ascii_order`].
-///
-/// Most real-world filenames are made up of lowercase ASCII letters and digits,
-/// for which byte order matches collation order in the common locales. Resolve
-/// those comparisons directly and only call into libc when the first differing
-/// byte falls outside that alphabet.
-fn collate_fast(order: &AsciiOrder, a: &OsStr, b: &OsStr) -> Ordering {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let common = a_bytes.len().min(b_bytes.len());
-
-    let mut index = 0;
-    while index < common && a_bytes[index] == b_bytes[index] {
-        index += 1;
-    }
-
-    if index == common {
-        if a_bytes.len() == b_bytes.len() {
-            return Ordering::Equal;
-        }
-
-        // Locale collation is not required to preserve prefix order (e.g. a
-        // name sorting after its own extension). The locale was probed once
-        // for a few representative bases; if any probe failed, the prefix
-        // shortcut is disabled entirely rather than guessed.
-        let next = if a_bytes.len() == common {
-            b_bytes[index]
-        } else {
-            a_bytes[index]
-        };
-        if next.is_ascii() && order.prefix_sorts_first {
-            return a_bytes.len().cmp(&b_bytes.len());
-        }
-    } else {
-        let left = a_bytes[index];
-        let right = b_bytes[index];
-        if is_simple(left) && is_simple(right) && order.simple_is_bytewise {
-            return left.cmp(&right);
-        }
-    }
-
-    collate_slow(a, b)
-}
-
-fn is_simple(byte: u8) -> bool {
-    byte.is_ascii_lowercase() || byte.is_ascii_digit()
-}
-
-struct AsciiOrder {
-    /// `[0-9a-z]` compare in byte order.
-    simple_is_bytewise: bool,
-    /// A name sorts before any ASCII extension of itself.
-    prefix_sorts_first: bool,
-}
-
-static ASCII_ORDER: OnceLock<AsciiOrder> = OnceLock::new();
-
-fn ascii_order() -> &'static AsciiOrder {
-    ASCII_ORDER.get_or_init(|| {
-        // Locales with multi-character collation elements (for example Czech
-        // "ch") do not compose per-character order. Only probe locales where
-        // ASCII order is plausibly stable.
-        if !locale_has_simple_ascii_order() {
-            return AsciiOrder {
-                simple_is_bytewise: false,
-                prefix_sorts_first: false,
-            };
-        }
-
-        const SIMPLE: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-        let simple_is_bytewise = SIMPLE.windows(2).all(|pair| {
-            let a = OsStr::from_bytes(&pair[..1]);
-            let b = OsStr::from_bytes(&pair[1..]);
-            collate_slow(a, b) == Ordering::Less
-        });
-
-        const PREFIX_BASES: &[&[u8]] = &[b"", b"a", b"0", b"file"];
-        let mut joined = [0u8; 8];
-        let prefix_sorts_first = PREFIX_BASES.iter().all(|base| {
-            (0x20u8..0x7f).all(|byte| {
-                joined[..base.len()].copy_from_slice(base);
-                joined[base.len()] = byte;
-                collate_slow(
-                    OsStr::from_bytes(base),
-                    OsStr::from_bytes(&joined[..=base.len()]),
-                ) == Ordering::Less
-            })
-        });
-
-        AsciiOrder {
-            simple_is_bytewise,
-            prefix_sorts_first,
-        }
-    })
-}
-
-fn locale_name() -> Option<std::ffi::OsString> {
-    ["LC_ALL", "LC_COLLATE", "LANG"]
-        .iter()
-        .filter_map(env::var_os)
-        .find(|value| !value.is_empty())
-}
-
-/// The C and C.UTF-8 locales compare names byte by byte.
-fn locale_is_bytewise() -> bool {
-    static BYTEWISE: OnceLock<bool> = OnceLock::new();
-    *BYTEWISE.get_or_init(|| {
-        let Some(name) = locale_name() else {
-            // No locale variables are set: the C locale.
-            return true;
-        };
-        let name = name.to_string_lossy();
-
-        name == "C"
-            || name == "POSIX"
-            || name.eq_ignore_ascii_case("C.UTF-8")
-            || name.eq_ignore_ascii_case("C.utf8")
-            || name.eq_ignore_ascii_case("C.UTF8")
-    })
-}
-
-/// Return whether the locale selected by `setlocale(LC_ALL, "")` uses plain
-/// ASCII order.
-///
-/// POSIX selects the locale from `LC_ALL`, then `LC_COLLATE`, then `LANG`, so
-/// reading the same variables avoids hard-coding platform-specific
-/// `LC_COLLATE` numbers. The `strcoll` probes above then verify the actual
-/// ordering and catch locales with unusual collation rules.
-fn locale_has_simple_ascii_order() -> bool {
-    let Some(name) = locale_name() else {
-        return true;
-    };
-    let name = name.to_string_lossy();
-
-    name == "C"
-        || name == "POSIX"
-        || name == "en"
-        || name.starts_with("C.")
-        || name.starts_with("en_")
-        || name.starts_with("en.")
-        || name.starts_with("en@")
-}
-
-fn collate_slow(a: &OsStr, b: &OsStr) -> Ordering {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-
-    // Filenames and argv entries cannot contain NUL, so there is no need to
-    // scan both names before every libc call.
-    if a_bytes.len() < STACK_NAME && b_bytes.len() < STACK_NAME {
-        let mut a_buffer = MaybeUninit::<[u8; STACK_NAME]>::uninit();
-        let mut b_buffer = MaybeUninit::<[u8; STACK_NAME]>::uninit();
-        unsafe {
-            let a_ptr = a_buffer.as_mut_ptr() as *mut u8;
-            let b_ptr = b_buffer.as_mut_ptr() as *mut u8;
-            ptr::copy_nonoverlapping(a_bytes.as_ptr(), a_ptr, a_bytes.len());
-            ptr::copy_nonoverlapping(b_bytes.as_ptr(), b_ptr, b_bytes.len());
-            a_ptr.add(a_bytes.len()).write(0);
-            b_ptr.add(b_bytes.len()).write(0);
-            return strcoll(a_ptr as *const c_char, b_ptr as *const c_char).cmp(&0);
-        }
-    }
-
-    match (CString::new(a_bytes), CString::new(b_bytes)) {
-        (Ok(a), Ok(b)) => unsafe { strcoll(a.as_ptr(), b.as_ptr()) }.cmp(&0),
-        _ => a_bytes.cmp(b_bytes),
-    }
-}
+/// Marks a [`Keyed`] record whose name has no key.
+const NO_KEY: u32 = u32::MAX;
 
 pub fn sort_entries(entries: &mut Vec<Entry>, opts: &Options) {
     match opts.sort {
@@ -266,81 +53,205 @@ fn group_directories_first(entries: &mut Vec<Entry>) {
     entries.extend(others);
 }
 
+/// Sort entries by name in the locale's collation order.
+///
+/// Directory entry names are unique, so unstable sorts cannot change the
+/// result. They also run in linear time on input that is already sorted or
+/// reversed, which readdir often returns.
 fn sort_names(entries: &mut [Entry]) {
-    let pairs = entries.len().saturating_sub(1);
-    if pairs == 0 {
+    if entries.len() < 2 {
         return;
     }
 
-    let collation = Collation::for_len(entries.len());
-    let compare = |a: &Entry, b: &Entry| collation.compare(a.name.as_os_str(), b.name.as_os_str());
-
-    // Sample adjacent pairs first. Readdir commonly returns names in nearly
-    // sorted or reverse-sorted order, so avoid a full sort when a linear scan
-    // can confirm the order instead.
-    const SAMPLE: usize = 256;
-    let probe = pairs.min(SAMPLE);
-    let mut inversions = 0;
-    let mut equal = 0;
-    for pair in entries.windows(2).take(probe) {
-        match compare(&pair[0], &pair[1]) {
-            Ordering::Greater => inversions += 1,
-            Ordering::Equal => equal += 1,
-            Ordering::Less => {}
-        }
-    }
-
-    if probe == pairs {
-        if inversions == 0 {
-            // Already in collation order.
-            return;
-        }
-        if equal == 0 && inversions == pairs {
-            entries.reverse();
-            return;
-        }
-    }
-
-    // The sample suggests a monotonic run. Verifying the whole slice is still
-    // cheaper than sorting it, and on large directories it can be done in
-    // parallel.
-    if equal == 0 && inversions * 4 < probe {
-        if is_sorted(entries, collation, false) {
-            return;
-        }
-    } else if equal == 0 && inversions * 4 > probe * 3 && is_sorted(entries, collation, true) {
-        entries.reverse();
-        return;
-    }
-
-    // Directory entry names are unique, so an unstable sort cannot change the
-    // result. It avoids the merge buffer and copying that a stable sort needs.
-    if entries.len() >= PARALLEL_SORT_THRESHOLD {
-        entries.par_sort_unstable_by(compare);
+    let mode = if entries.len() >= KEYED_MIN {
+        collate::key_mode()
     } else {
-        entries.sort_unstable_by(compare);
+        collate::verified_key_mode()
+    };
+    // Key offsets are 32-bit; absurdly large directories use plain sorting.
+    let key_bytes: usize = entries.iter().map(|entry| entry.name.len()).sum();
+    match mode {
+        Some(mode) if key_bytes < NO_KEY as usize && entries.len() < NO_KEY as usize => {
+            sort_keyed(entries, mode);
+        }
+        _ => sort_slice(entries, |a, b| collate::collate(&a.name, &b.name)),
     }
 }
 
-/// Check whether the entries are in ascending (or strictly descending) name
-/// order.
-fn is_sorted(entries: &[Entry], collation: Collation, descending: bool) -> bool {
-    let in_order = |a: &Entry, b: &Entry| {
-        let ordering = collation.compare(a.name.as_os_str(), b.name.as_os_str());
-        if descending {
-            ordering == Ordering::Greater
+fn sort_slice<T: Send>(items: &mut [T], compare: impl Fn(&T, &T) -> Ordering + Sync) {
+    if items.len() >= PARALLEL_SORT_THRESHOLD {
+        items.par_sort_unstable_by(compare);
+    } else {
+        items.sort_unstable_by(compare);
+    }
+}
+
+/// An entry's position and sort key. Sorting these moves 24 bytes per entry
+/// instead of a whole [`Entry`].
+#[derive(Clone, Copy)]
+struct Keyed {
+    /// The first eight key bytes, big-endian and zero-padded. Key bytes are
+    /// never zero, so prefixes order keys correctly up to their eighth byte.
+    prefix: u64,
+    /// Location of the key in the shared key buffer; `len` is [`NO_KEY`]
+    /// when the name has no key.
+    start: u32,
+    len: u32,
+    /// Index of the entry this record stands for.
+    index: u32,
+}
+
+fn sort_keyed(entries: &mut [Entry], mode: KeyMode) {
+    let (keys, mut records) = build_keys(entries, mode);
+
+    let names = &*entries;
+    let key = |record: &Keyed| &keys[record.start as usize..][..record.len as usize];
+    let name = |record: &Keyed| names[record.index as usize].name.as_os_str();
+    let shortcut = |a: &Keyed, b: &Keyed| {
+        if a.len != NO_KEY && b.len != NO_KEY {
+            let ordering = a.prefix.cmp(&b.prefix).then_with(|| {
+                // Equal prefixes mean the first `skip` bytes are equal.
+                let skip = 8.min(a.len).min(b.len) as usize;
+                key(a)[skip..].cmp(&key(b)[skip..])
+            });
+            (ordering != Ordering::Equal).then_some(ordering)
         } else {
-            ordering != Ordering::Greater
+            mode.first_difference(name(a).as_bytes(), name(b).as_bytes())
         }
     };
-
-    if entries.len() >= PARALLEL_SORT_THRESHOLD {
-        (0..entries.len() - 1)
-            .into_par_iter()
-            .all(|index| in_order(&entries[index], &entries[index + 1]))
+    let compare = |a: &Keyed, b: &Keyed| match shortcut(a, b) {
+        Some(ordering) => {
+            debug_assert_eq!(
+                ordering,
+                mode.tie_break(name(a), name(b)),
+                "shortcut order disagrees with collation for {:?} and {:?}",
+                name(a),
+                name(b),
+            );
+            ordering
+        }
+        None => mode.tie_break(name(a), name(b)),
+    };
+    if records.len() >= PARALLEL_SORT_THRESHOLD {
+        // rayon's parallel quicksort partitions the whole slice on one
+        // thread before splitting; the merge sort sorts chunks and merges
+        // them in parallel from the start. Records are small, so its scratch
+        // buffer is cheap; stability itself does not matter here.
+        records.par_sort_by(compare);
     } else {
-        entries.windows(2).all(|pair| in_order(&pair[0], &pair[1]))
+        records.sort_unstable_by(compare);
     }
+
+    let order: Vec<u32> = records.iter().map(|record| record.index).collect();
+    apply_order(entries, &order);
+}
+
+/// Build every entry's key into one shared buffer, plus a record per entry.
+/// Large directories build chunks in parallel and then concatenate them.
+fn build_keys(entries: &[Entry], mode: KeyMode) -> (Vec<u8>, Vec<Keyed>) {
+    const CHUNK: usize = 4096;
+
+    let build = |first_index: usize, chunk: &[Entry]| {
+        let mut keys = Vec::with_capacity(chunk.iter().map(|entry| entry.name.len()).sum());
+        let records: Vec<Keyed> = (first_index as u32..)
+            .zip(chunk)
+            .map(|(index, entry)| {
+                let start = keys.len();
+                let has_key = mode.push_key(entry.name.as_bytes(), &mut keys);
+                Keyed {
+                    prefix: key_prefix(&keys[start..]),
+                    start: start as u32,
+                    len: if has_key {
+                        (keys.len() - start) as u32
+                    } else {
+                        NO_KEY
+                    },
+                    index,
+                }
+            })
+            .collect();
+        (keys, records)
+    };
+
+    if entries.len() < PARALLEL_SORT_THRESHOLD {
+        return build(0, entries);
+    }
+
+    let chunks: Vec<(Vec<u8>, Vec<Keyed>)> = entries
+        .par_chunks(CHUNK)
+        .enumerate()
+        .map(|(chunk_index, chunk)| build(chunk_index * CHUNK, chunk))
+        .collect();
+    let mut keys = Vec::with_capacity(chunks.iter().map(|(keys, _)| keys.len()).sum());
+    let mut records = Vec::with_capacity(entries.len());
+    for (chunk_keys, chunk_records) in chunks {
+        let base = keys.len() as u32;
+        keys.extend_from_slice(&chunk_keys);
+        records.extend(chunk_records.into_iter().map(|record| Keyed {
+            start: record.start + base,
+            ..record
+        }));
+    }
+    (keys, records)
+}
+
+fn key_prefix(key: &[u8]) -> u64 {
+    let mut bytes = [0u8; 8];
+    let len = key.len().min(8);
+    bytes[..len].copy_from_slice(&key[..len]);
+    u64::from_be_bytes(bytes)
+}
+
+/// Rearrange `items` so that position `i` holds the item previously at
+/// `order[i]`.
+///
+/// Each item is moved exactly once into a scratch buffer, in output order,
+/// and the buffer is then copied back. Large slices gather in parallel.
+///
+/// # Panics
+///
+/// Panics if `order` is not a permutation of `0..items.len()`.
+pub fn apply_order<T: Send>(items: &mut [T], order: &[u32]) {
+    let len = items.len();
+    let mut seen = vec![false; len];
+    assert!(
+        order.len() == len
+            && order
+                .iter()
+                .all(|&index| !std::mem::replace(&mut seen[index as usize], true)),
+        "apply_order needs a permutation"
+    );
+
+    /// Raw pointer that may be shared across rayon workers. Accessed only
+    /// through `get` so closures capture the wrapper, not the pointer field.
+    struct Shared<T>(*mut T);
+    unsafe impl<T: Send> Sync for Shared<T> {}
+    impl<T> Shared<T> {
+        fn get(&self) -> *mut T {
+            self.0
+        }
+    }
+
+    let mut sorted: Vec<T> = Vec::with_capacity(len);
+    let source = Shared(items.as_mut_ptr());
+    let target = Shared(sorted.as_mut_ptr());
+    // SAFETY: `order` is a permutation (checked above), so every source slot
+    // is read exactly once and every target slot written exactly once. The
+    // gathered items are then copied over the originals, all of which were
+    // moved out. `sorted` keeps length 0, so nothing is dropped twice, and
+    // no code between the reads and the copy-back can panic.
+    let gather = |(position, &index): (usize, &u32)| unsafe {
+        target
+            .get()
+            .add(position)
+            .write(source.get().add(index as usize).read());
+    };
+    if len >= PARALLEL_SORT_THRESHOLD {
+        order.par_iter().enumerate().for_each(gather);
+    } else {
+        order.iter().enumerate().for_each(gather);
+    }
+    unsafe { std::ptr::copy_nonoverlapping(sorted.as_ptr(), items.as_mut_ptr(), len) };
 }
 
 /// Sort by a descending primary key, then by name within equal-key runs.

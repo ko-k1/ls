@@ -487,3 +487,115 @@ fn small_and_large_directories_sort_consistently() {
         .collect();
     assert_eq!(small_order.lines().collect::<Vec<_>>(), expected);
 }
+
+/// Names that stress collation: families that tie at level 1 and differ
+/// only in case or punctuation, `$` (weighted at level 1, unlike other
+/// punctuation), names made only of ignored characters, and non-ASCII.
+fn collation_corpus() -> Vec<String> {
+    const PIECES: &[&str] = &[
+        "a", "b", "m", "z", "A", "B", "M", "Z", "0", "1", "5", "9", "$", " ", "-", "_", ".", ",",
+        "+", "(", ")", "[", "]", "'", "!", "@", "#", "%", "&", "~", "=", "é", "ü", "資", "メ",
+    ];
+    let mut names = std::collections::BTreeSet::new();
+    for base in ["abc", "file1", "readme", "img2023", "x"] {
+        names.insert(base.to_string());
+        names.insert(base.to_uppercase());
+        names.insert(base[..1].to_uppercase() + &base[1..]);
+        for separator in ["_", "-", ".", " ", "$"] {
+            for position in 0..=base.len() {
+                names.insert(format!(
+                    "{}{separator}{}",
+                    &base[..position],
+                    &base[position..]
+                ));
+            }
+        }
+    }
+
+    // Deterministic xorshift so failures reproduce.
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    while names.len() < 3000 {
+        let len = 1 + next() % 10;
+        let name: String = (0..len)
+            .map(|_| PIECES[(next() % PIECES.len() as u64) as usize])
+            .collect();
+        if name != "." && name != ".." {
+            names.insert(name);
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// The listing must be in `strcoll` order, checked with this process's own
+/// libc. Debug builds of ls additionally assert every comparison that its
+/// sort keys decide against `strcoll`.
+#[test]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn name_order_matches_strcoll() {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int};
+
+    extern "C" {
+        fn setlocale(category: c_int, locale: *const c_char) -> *mut c_char;
+        fn strcoll(a: *const c_char, b: *const c_char) -> c_int;
+    }
+    const LC_COLLATE: c_int = 3;
+
+    let locale = CString::new("en_US.UTF-8").unwrap();
+    // Only this test uses locale-dependent libc functions in this process.
+    if unsafe { setlocale(LC_COLLATE, locale.as_ptr()) }.is_null() {
+        eprintln!("en_US.UTF-8 is not installed; skipping");
+        return;
+    }
+    let collate = |a: &str, b: &str| {
+        let (a, b) = (CString::new(a).unwrap(), CString::new(b).unwrap());
+        unsafe { strcoll(a.as_ptr(), b.as_ptr()) }
+    };
+
+    let names = collation_corpus();
+    let dir = TestDir::new("strcoll-order");
+    for name in &names {
+        fs::write(dir.path().join(name), "").unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ls"))
+        .arg("-1A")
+        .current_dir(dir.path())
+        .env("LANG", "en_US.UTF-8")
+        .env_remove("LC_ALL")
+        .env_remove("LC_COLLATE")
+        .output()
+        .expect("failed to run ls");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let listed: Vec<&str> = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .collect();
+    let mut expected_set: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut listed_set = listed.clone();
+    expected_set.sort_unstable();
+    listed_set.sort_unstable();
+    assert_eq!(
+        listed_set, expected_set,
+        "listing is not a permutation of the created names"
+    );
+    for pair in listed.windows(2) {
+        assert!(
+            collate(pair[0], pair[1]) <= 0,
+            "{:?} listed before {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+}

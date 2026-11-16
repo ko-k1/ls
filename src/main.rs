@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::io::Write;
 
 mod args;
+mod collate;
 mod color;
 mod dir;
 mod entry;
@@ -53,8 +54,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use crate::collate::{KeyMode, Level1Table};
     use crate::quoting::quote_name;
     use crate::sizes::{format_blocks, human_size};
+    use crate::sort::apply_order;
     use crate::time::{civil_from_days, format_time_at, utc_datetime, DateTime};
 
     #[test]
@@ -184,5 +187,81 @@ mod tests {
         assert_eq!(civil_from_days(59), (1970, 3, 1));
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    }
+
+    fn all_permutations(len: u32) -> Vec<Vec<u32>> {
+        if len == 0 {
+            return vec![Vec::new()];
+        }
+        let mut result = Vec::new();
+        for shorter in all_permutations(len - 1) {
+            for position in 0..=shorter.len() {
+                let mut permutation = shorter.clone();
+                permutation.insert(position, len - 1);
+                result.push(permutation);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn apply_order_handles_every_permutation() {
+        for len in 0..=6 {
+            for permutation in all_permutations(len) {
+                let original: Vec<String> = (0..len).map(|index| format!("item{index}")).collect();
+                let expected: Vec<String> = permutation
+                    .iter()
+                    .map(|&index| original[index as usize].clone())
+                    .collect();
+                let mut items = original.clone();
+                apply_order(&mut items, &permutation);
+                assert_eq!(items, expected, "order {permutation:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn apply_order_gathers_large_slices_in_parallel() {
+        // Large enough for the parallel path; a multiplicative step modulo a
+        // prime-length slice visits every index exactly once.
+        let len = 20_011u32;
+        let order: Vec<u32> = (0..len).map(|index| (index * 7919) % len).collect();
+        let mut items: Vec<String> = (0..len).map(|index| index.to_string()).collect();
+        apply_order(&mut items, &order);
+        assert!(items
+            .iter()
+            .zip(&order)
+            .all(|(item, &index)| *item == index.to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "permutation")]
+    fn apply_order_rejects_repeated_indices() {
+        let mut items = vec![String::from("a"), String::from("b")];
+        apply_order(&mut items, &[0, 0]);
+    }
+
+    #[test]
+    fn level1_keys_drop_ignored_characters_and_fold_case() {
+        let table: &'static Level1Table = Box::leak(Box::new(Level1Table::expected()));
+        let mode = KeyMode::Level1(table);
+        let key = |name: &str| {
+            let mut out = Vec::new();
+            mode.push_key(name.as_bytes(), &mut out).then_some(out)
+        };
+
+        assert_eq!(key("IMG_2023.jpg"), key("img2023jpg"));
+        assert_eq!(key("a-b c.d(1)"), key("abcd1"));
+        assert_eq!(key("_-. "), Some(Vec::new()));
+        assert!(key("$") < key("0") && key("0") < key("9") && key("9") < key("a"));
+        assert!(key("a") < key("B") && key("Y") < key("z"));
+        assert!(key("ab") < key("ab_c"));
+        assert_eq!(key("café"), None);
+        assert_eq!(key("tab\there"), None);
+
+        // A name without a key leaves earlier keys in the buffer intact.
+        let mut out = b"abc".to_vec();
+        assert!(!mode.push_key("資料".as_bytes(), &mut out));
+        assert_eq!(out, b"abc");
     }
 }
