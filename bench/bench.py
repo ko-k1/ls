@@ -34,6 +34,7 @@ INSTRUCTION_CASES = [
     ("m1k -1", "{fx}/m1k", ["-1"]),
     ("m1k -l", "{fx}/m1k", ["-l"]),
     ("small(40) -R", "{fx}/small", ["-R"]),
+    ("j1k -1 (Japanese names)", "{fx}/j1k", ["-1"]),
 ]
 
 TIMED_CASES = [
@@ -50,6 +51,10 @@ TIMED_CASES = [
     ("m100k -1", "{fx}/m100k", ["-1"], False),
     ("m100k -1U", "{fx}/m100k", ["-1U"], False),
     ("l100k -1", "{fx}/l100k", ["-1"], False),
+    ("j10k -1 (Japanese)", "{fx}/j10k", ["-1"], False),
+    ("j100k -1 (Japanese)", "{fx}/j100k", ["-1"], False),
+    ("j100k tty (Japanese)", "{fx}/j100k", [], True),
+    ("h100k -1 (58% Japanese)", "{fx}/h100k", ["-1"], False),
     ("m100k -l", "{fx}/m100k", ["-l"], False),
     ("m100k -lt", "{fx}/m100k", ["-lt"], False),
     ("m100k -la --color", "{fx}/m100k", ["-la", "--color=always"], False),

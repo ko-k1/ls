@@ -31,6 +31,7 @@ use std::sync::OnceLock;
 
 extern "C" {
     fn strcoll(a: *const c_char, b: *const c_char) -> c_int;
+    fn strxfrm(dest: *mut c_char, src: *const c_char, n: usize) -> usize;
 }
 
 /// Largest filename component on Unix. Keeping the C string on the stack
@@ -53,6 +54,10 @@ pub enum KeyMode {
     Bytes,
     /// Level-1 weights of ASCII characters (see the module documentation).
     Level1(&'static Level1Table),
+    /// `strxfrm` output. Its byte order is meant to be `strcoll` order, but
+    /// glibc does not always deliver that, so callers must verify the result
+    /// with `strcoll` (see `sort::restore_collation_order`).
+    Strxfrm,
 }
 
 impl KeyMode {
@@ -66,6 +71,7 @@ impl KeyMode {
                 out.extend_from_slice(name);
                 true
             }
+            Self::Strxfrm => push_strxfrm(name, out),
             Self::Level1(table) => {
                 let start = out.len();
                 for &byte in name {
@@ -105,8 +111,42 @@ impl KeyMode {
     pub fn tie_break(self, a: &OsStr, b: &OsStr) -> Ordering {
         match self {
             Self::Bytes => a.as_bytes().cmp(b.as_bytes()),
-            Self::Level1(_) => strcoll_bytes(a.as_bytes(), b.as_bytes()),
+            Self::Level1(_) | Self::Strxfrm => strcoll_bytes(a.as_bytes(), b.as_bytes()),
         }
+    }
+}
+
+/// Append the `strxfrm` transformation of `name` to `out`. The output is a
+/// C string, so key bytes are never zero.
+fn push_strxfrm(name: &[u8], out: &mut Vec<u8>) -> bool {
+    // Filename components are shorter than STACK_NAME (NAME_MAX is 255).
+    if name.len() >= STACK_NAME {
+        return false;
+    }
+    let mut source = [0u8; STACK_NAME];
+    source[..name.len()].copy_from_slice(name);
+
+    let start = out.len();
+    let mut room = name.len() * 8 + 32;
+    loop {
+        out.reserve(room);
+        let spare = out.spare_capacity_mut();
+        // SAFETY: `source` is NUL-terminated and `spare` is writable for
+        // `spare.len()` bytes. strxfrm writes at most that many bytes and
+        // returns the full length; when it fits, that many bytes (plus a
+        // NUL) were written, so extending the length over them is sound.
+        let length = unsafe {
+            strxfrm(
+                spare.as_mut_ptr().cast(),
+                source.as_ptr().cast(),
+                spare.len(),
+            )
+        };
+        if length < spare.len() {
+            unsafe { out.set_len(start + length) };
+            return true;
+        }
+        room = length + 1;
     }
 }
 

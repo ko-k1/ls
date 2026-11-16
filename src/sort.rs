@@ -1,4 +1,5 @@
 use std::cmp::{Ordering, Reverse};
+use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 
 use rayon::prelude::*;
@@ -70,14 +71,53 @@ fn sort_names(entries: &mut [&Entry<'_>]) {
     } else {
         collate::verified_key_mode()
     };
+    // Non-ASCII names have no level-1 key, so comparisons involving them
+    // mostly call strcoll. When that adds up, sort by strxfrm keys instead
+    // (see `strxfrm_pays_off` and `restore_collation_order`).
+    let mode = match mode {
+        Some(KeyMode::Level1(_)) if strxfrm_pays_off(entries) => Some(KeyMode::Strxfrm),
+        mode => mode,
+    };
     // Key offsets are 32-bit; absurdly large directories use plain sorting.
+    // strxfrm keys run to several times the name length, hence the margin.
     let key_bytes: usize = entries.iter().map(|entry| entry.name.len()).sum();
+    let key_limit = match mode {
+        Some(KeyMode::Strxfrm) => NO_KEY as usize / 32,
+        _ => NO_KEY as usize,
+    };
     match mode {
-        Some(mode) if key_bytes < NO_KEY as usize && entries.len() < NO_KEY as usize => {
+        Some(mode) if key_bytes < key_limit && entries.len() < NO_KEY as usize => {
             sort_keyed(entries, mode);
         }
         _ => sort_slice(entries, |a, b| collate::collate(a.name, b.name)),
     }
+}
+
+/// Whether sorting by strxfrm keys beats level-1 keys with strcoll.
+///
+/// With a fraction `f` of non-ASCII names, about `p = 1 - (1 - f)²` of
+/// comparisons involve one and usually need strcoll, so level-1 sorting
+/// costs about `p · log₂ n` strcoll calls per name. strxfrm keys plus the
+/// strcoll check cost a roughly fixed amount per name, and their setup is
+/// not worth it for small directories. Fitted to measurements under
+/// en_US.UTF-8 (all-Japanese, half-Japanese and 5-40% mixes, 40 to 100k
+/// names): strxfrm from 256 names when `p · log₂ n ≥ 3`.
+fn strxfrm_pays_off(entries: &[&Entry<'_>]) -> bool {
+    const MIN_NAMES: usize = 256;
+    const MIN_STRCOLL_PER_NAME: f64 = 3.0;
+    if entries.len() < MIN_NAMES {
+        return false;
+    }
+    let len = entries.len() as f64;
+    let non_ascii = entries
+        .iter()
+        .filter(|entry| !entry.name.as_bytes().is_ascii())
+        .count();
+    let fraction = non_ascii as f64 / len;
+    let undecided = 1.0 - (1.0 - fraction) * (1.0 - fraction);
+    // Integer log₂ is precise enough here, and f64::log2 would link libm,
+    // whose loading costs every run ~50k instructions.
+    undecided * f64::from(entries.len().ilog2()) >= MIN_STRCOLL_PER_NAME
 }
 
 fn sort_slice<T: Send>(items: &mut [T], compare: impl Fn(&T, &T) -> Ordering + Sync) {
@@ -121,17 +161,21 @@ fn sort_keyed(entries: &mut [&Entry<'_>], mode: KeyMode) {
             mode.first_difference(name(a).as_bytes(), name(b).as_bytes())
         }
     };
+    let strxfrm = matches!(mode, KeyMode::Strxfrm);
     let compare = |a: &Keyed, b: &Keyed| match shortcut(a, b) {
         Some(ordering) => {
-            debug_assert_eq!(
-                ordering,
-                mode.tie_break(name(a), name(b)),
-                "shortcut order disagrees with collation for {:?} and {:?}",
+            // glibc's strxfrm can disagree with strcoll (fixed up below).
+            debug_assert!(
+                strxfrm || ordering == mode.tie_break(name(a), name(b)),
+                "key order disagrees with collation for {:?} and {:?}",
                 name(a),
                 name(b),
             );
             ordering
         }
+        // With strxfrm keys, comparisons must not mix in strcoll: the two
+        // may disagree, and a sort needs one consistent order.
+        None if strxfrm => name(a).as_bytes().cmp(name(b).as_bytes()),
         None => mode.tie_break(name(a), name(b)),
     };
     if records.len() >= PARALLEL_SORT_THRESHOLD {
@@ -143,6 +187,16 @@ fn sort_keyed(entries: &mut [&Entry<'_>], mode: KeyMode) {
     } else {
         records.sort_unstable_by(compare);
     }
+
+    if strxfrm {
+        restore_collation_order(&mut records, name);
+    }
+    debug_assert!(
+        records
+            .windows(2)
+            .all(|pair| mode.tie_break(name(&pair[0]), name(&pair[1])) != Ordering::Greater),
+        "names are not in collation order"
+    );
 
     let sorted: Vec<&Entry<'_>> = records
         .iter()
@@ -198,6 +252,29 @@ fn build_keys(entries: &[&Entry<'_>], mode: KeyMode) -> (Vec<u8>, Vec<Keyed>) {
         }));
     }
     (keys, records)
+}
+
+/// Make sure records sorted by strxfrm keys are in strcoll order.
+///
+/// POSIX promises that strxfrm keys order strings as strcoll does, but
+/// glibc (2.43 at least) breaks that for some names: a randomized test found
+/// about 30 disagreements per million pairs among names mixing punctuation
+/// with non-ASCII letters. Checking adjacent pairs with strcoll costs `n`
+/// calls (in parallel) instead of the `n log n` a strcoll sort needs, and if
+/// every pair is in order, so is the whole sequence. Otherwise the records
+/// are re-sorted by strcoll; the stable sort is adaptive, so input that is
+/// nearly in order costs little more than the check.
+fn restore_collation_order<'e>(records: &mut [Keyed], name: impl Fn(&Keyed) -> &'e OsStr + Sync) {
+    let in_order =
+        |pair: &[Keyed]| collate::collate(name(&pair[0]), name(&pair[1])) != Ordering::Greater;
+    let sorted = if records.len() >= PARALLEL_SORT_THRESHOLD {
+        records.par_windows(2).all(in_order)
+    } else {
+        records.windows(2).all(in_order)
+    };
+    if !sorted {
+        records.sort_by(|a, b| collate::collate(name(a), name(b)));
+    }
 }
 
 fn key_prefix(key: &[u8]) -> u64 {

@@ -47,6 +47,26 @@ def mixed_name(i):
     return f"{rng.choice(WORDS)}_{rng.choice(WORDS)}_v{i}.{rng.choice(EXTS) or 'bin'}"
 
 
+JA_WORDS = ["写真", "資料", "議事録", "メモ", "報告書", "請求書", "見積", "設計", "会議",
+            "旅行", "家族", "仕事", "プロジェクト", "バックアップ", "ダウンロード", "スクリーンショット",
+            "東京", "大阪", "最終版", "下書き", "ノート", "レシピ", "音楽", "動画"]
+
+
+def japanese_name(i):
+    """Names as found in a Japanese user's Documents or Pictures folder."""
+    r = rng.random()
+    words = "_".join(rng.choice(JA_WORDS) for _ in range(rng.randint(1, 3)))
+    if r < 0.4:
+        return f"{words}_{rng.randint(2015, 2026)}{rng.randint(1, 12):02d}{rng.randint(1, 28):02d}_{i}.{rng.choice(['jpg', 'pdf', 'docx', 'xlsx', 'png'])}"
+    if r < 0.7:
+        return f"{words}（{rng.randint(1, 9)}）{i}.{rng.choice(['pdf', 'txt', 'md'])}"
+    return f"{words}{i}"
+
+
+def half_japanese_name(i):
+    return japanese_name(i) if rng.random() < 0.5 else mixed_name(i)
+
+
 def lower_name(i):
     letters = "abcdefghijklmnopqrstuvwxyz"
     return "".join(rng.choice(letters) for _ in range(rng.randint(5, 12))) + str(i)
@@ -91,6 +111,10 @@ FIXTURES = [
     ("m10k", lambda p: populate(p, 10_000, mixed_name)),
     ("m100k", lambda p: populate(p, 100_000, mixed_name)),
     ("l100k", lambda p: populate(p, 100_000, lower_name, kinds=False)),
+    ("j1k", lambda p: populate(p, 1_000, japanese_name, kinds=False)),
+    ("j10k", lambda p: populate(p, 10_000, japanese_name, kinds=False)),
+    ("j100k", lambda p: populate(p, 100_000, japanese_name, kinds=False)),
+    ("h100k", lambda p: populate(p, 100_000, half_japanese_name, kinds=False)),
     ("tree", lambda p: tree(p, 8, 3, 160)),  # 585 dirs x 160 files ~= 94k entries
 ]
 
